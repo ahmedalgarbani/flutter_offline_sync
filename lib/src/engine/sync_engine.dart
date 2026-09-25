@@ -373,8 +373,8 @@ class SyncEngine with WidgetsBindingObserver {
   /// One ordered walk over the outbox. Returns true if anything changed
   /// that could unblock other operations.
   Future<bool> _pushPass(SyncRunResult result, Set<String>? only) async {
-    final ops = await store.operations(
-        statuses: {SyncOpStatus.pending, SyncOpStatus.failed});
+    final ops = await store
+        .operations(statuses: {SyncOpStatus.pending, SyncOpStatus.failed});
     final blocked = <String>{
       for (final op in ops)
         if (op.isFailed) _recordKey(op.entity, op.localId),
@@ -650,8 +650,8 @@ class SyncEngine with WidgetsBindingObserver {
           await cfg.local
               .applyRemote(merged, localId: op.localId, serverId: serverId);
         }
-        await _backoff(op.copyWith(payload: merged), outcome.error ?? 'Conflict',
-            result,
+        await _backoff(
+            op.copyWith(payload: merged), outcome.error ?? 'Conflict', result,
             retryAfter: Duration.zero, force: true);
       case TakeServer():
         final serverId = request.serverId ??
@@ -718,8 +718,8 @@ class SyncEngine with WidgetsBindingObserver {
     final result = SyncRunResult();
     await _ensureInit();
     await _pull(result, entities);
-    _status.value = _status.value.copyWith(
-        phase: SyncPhase.idle, clearCurrentEntity: true);
+    _status.value =
+        _status.value.copyWith(phase: SyncPhase.idle, clearCurrentEntity: true);
     return result;
   }
 
@@ -736,7 +736,8 @@ class SyncEngine with WidgetsBindingObserver {
 
   Future<void> _pullEntity(SyncEntityConfig cfg, SyncRunResult result) async {
     final incremental = cfg.pullMode == PullMode.incremental;
-    String? cursor = incremental ? await store.getMeta(_cursorKey(cfg.name)) : null;
+    String? cursor =
+        incremental ? await store.getMeta(_cursorKey(cfg.name)) : null;
     final seen = <String>{};
 
     while (true) {
@@ -877,7 +878,8 @@ class SyncEngine with WidgetsBindingObserver {
     if (localId == null) return;
     final pending = await store.operationsFor(cfg.name, localId);
     if (pending.isNotEmpty) {
-      _log(SyncLogLevel.warning,
+      _log(
+          SyncLogLevel.warning,
           '${cfg.name}/$localId was deleted on the server; dropping '
           '${pending.length} unpushed operation(s)');
       for (final o in pending) {
@@ -909,7 +911,9 @@ class SyncEngine with WidgetsBindingObserver {
       if (resolved.values.any((v) => v != null)) {
         out = reference.rewrite(out, (value) {
           final localRef = resolved[SyncIds.normalize(value)];
-          return localRef == null ? value : SyncIds.toJsonValue(localRef, value);
+          return localRef == null
+              ? value
+              : SyncIds.toJsonValue(localRef, value);
         });
       }
     }
@@ -935,8 +939,8 @@ class SyncEngine with WidgetsBindingObserver {
   // Inspection & maintenance --------------------------------------------------
 
   /// Operations waiting to be pushed, oldest first.
-  Future<List<SyncOperation>> pendingOperations() => store.operations(
-      statuses: {SyncOpStatus.pending, SyncOpStatus.inFlight});
+  Future<List<SyncOperation>> pendingOperations() =>
+      store.operations(statuses: {SyncOpStatus.pending, SyncOpStatus.inFlight});
 
   /// Operations that need attention.
   Future<List<SyncOperation>> failedOperations() =>

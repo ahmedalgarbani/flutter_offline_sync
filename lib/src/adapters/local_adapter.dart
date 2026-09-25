@@ -36,7 +36,8 @@ abstract class LocalAdapter {
   /// Returns the payload to send, read fresh from the database (for example
   /// a bill with its current lines). Return null to send the payload that
   /// was recorded with the operation.
-  Future<Map<String, dynamic>?> buildPushPayload(SyncOperation operation) async =>
+  Future<Map<String, dynamic>?> buildPushPayload(
+          SyncOperation operation) async =>
       null;
 
   /// Fallback for records that existed before the engine was installed:

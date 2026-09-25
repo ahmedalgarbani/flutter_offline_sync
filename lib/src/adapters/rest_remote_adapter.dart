@@ -105,8 +105,7 @@ class UpdatedSincePagination extends PullPagination {
   PullPage toPage(
       List<Map<String, dynamic>> records, String? cursor, int limit) {
     String? newest = cursor;
-    DateTime? newestTime =
-        cursor == null ? null : DateTime.tryParse(cursor);
+    DateTime? newestTime = cursor == null ? null : DateTime.tryParse(cursor);
     for (final record in records) {
       final raw = updatedAtOf(record);
       final time = raw == null ? null : DateTime.tryParse(raw);
@@ -243,13 +242,16 @@ class RestRemoteAdapter extends RemoteAdapter {
       return const PushOutcome.success();
     }
     if (code == 408 || code == 425 || code == 429 || code >= 500) {
-      final retryAfter = int.tryParse(
-          response.headers['retry-after'] ?? response.headers['Retry-After'] ?? '');
+      final retryAfter = int.tryParse(response.headers['retry-after'] ??
+          response.headers['Retry-After'] ??
+          '');
       return PushOutcome.retry(_message(response),
-          retryAfter: retryAfter == null ? null : Duration(seconds: retryAfter));
+          retryAfter:
+              retryAfter == null ? null : Duration(seconds: retryAfter));
     }
 
-    final failure = code >= 400 ? _message(response) : applicationError(response);
+    final failure =
+        code >= 400 ? _message(response) : applicationError(response);
     if (failure != null) {
       if (request.type == SyncOpType.create && isAlreadyExists(response)) {
         final id = SyncIds.normalize(extractServerId(response.body));
@@ -281,7 +283,8 @@ class RestRemoteAdapter extends RemoteAdapter {
     if (code == 401 || code == 403) {
       throw SyncUnauthorizedException(_message(response));
     }
-    final failure = code >= 400 ? _message(response) : applicationError(response);
+    final failure =
+        code >= 400 ? _message(response) : applicationError(response);
     if (failure != null) throw SyncRejectedException(failure);
     return pagination.toPage(
         extractRecords(response.body), request.cursor, request.limit);
