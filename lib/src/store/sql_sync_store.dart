@@ -100,8 +100,8 @@ class SqlSyncStore implements SyncStore {
   @override
   Future<T> transaction<T>(Future<T> Function() action) {
     if (Zone.current[_txKey] == true) return action();
-    return executor.transaction(
-        () => runZoned(action, zoneValues: {_txKey: true}));
+    return executor
+        .transaction(() => runZoned(action, zoneValues: {_txKey: true}));
   }
 
   @override
@@ -166,8 +166,8 @@ class SqlSyncStore implements SyncStore {
   @override
   Future<Map<SyncOpStatus, int>> countByStatus() async {
     final counts = {for (final s in SyncOpStatus.values) s: 0};
-    final rows = await executor.query(
-        'SELECT status, COUNT(*) AS n FROM $_outbox GROUP BY status');
+    final rows = await executor
+        .query('SELECT status, COUNT(*) AS n FROM $_outbox GROUP BY status');
     for (final row in rows) {
       final status = SyncOpStatus.values.byName(row['status']! as String);
       counts[status] = (row['n']! as num).toInt();
@@ -215,9 +215,9 @@ class SqlSyncStore implements SyncStore {
           [entity, localId, serverId]);
 
   @override
-  Future<void> deleteMapping(String entity, String localId) =>
-      executor.execute('DELETE FROM $_idMap WHERE entity = ? AND local_id = ?',
-          [entity, localId]);
+  Future<void> deleteMapping(String entity, String localId) => executor.execute(
+      'DELETE FROM $_idMap WHERE entity = ? AND local_id = ?',
+      [entity, localId]);
 
   @override
   Future<String?> getMeta(String key) async {

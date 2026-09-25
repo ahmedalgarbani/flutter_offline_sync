@@ -67,8 +67,7 @@ class SyncConfig {
 
   /// Called when an operation is marked failed (rejected, or out of
   /// attempts). Show it to the user; it stays in the outbox.
-  final void Function(SyncOperation operation, Object error)?
-      onOperationFailed;
+  final void Function(SyncOperation operation, Object error)? onOperationFailed;
 
   final SyncLogger? logger;
 

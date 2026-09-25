@@ -1,25 +1,41 @@
-<div dir="rtl">
+# flutter_offline_sync
 
-# flutter_sync
+[![pub package](https://img.shields.io/pub/v/flutter_offline_sync.svg)](https://pub.dev/packages/flutter_offline_sync)
+[![license](https://img.shields.io/github/license/ahmedalgarbani/flutter_offline_sync.svg)](LICENSE)
 
-محرّك مزامنة **Offline-First** لتطبيقات Flutter، يعمل مع قاعدة بياناتك وخادمك الحاليين.
+An **offline-first** sync engine for Flutter that works with the database and
+backend you already have.
 
-التطبيق **يقرأ ويكتب دائمًا في قاعدة البيانات المحلية**. تسجّل `flutter_sync` كل تغيير في صندوق صادر دائم (outbox)،
-وترسله إلى الخادم عند الإمكان، بالترتيب الصحيح ومرة واحدة فقط. كما تجلب تغييرات الخادم دون الكتابة فوق تعديلات لم تُرفع بعد.
+Your app **always reads and writes its local database**. `flutter_offline_sync`
+records every change in a durable outbox and sends it to the server when
+possible, in the right order, exactly once. It also pulls server changes down
+without overwriting edits that have not been pushed yet.
 
-- **رفع يراعي الاعتماديات:** لا تصل الفاتورة إلى الخادم قبل عميلها، ولا العميل قبل حسابه. وتُستبدل المعرّفات المحلية في المراجع بمعرّفات الخادم تلقائيًا، في مزامنة واحدة.
-- **لا تخمين:** المعرّف المحلي الذي لم يحصل على معرّف خادم بعد لا يُرسل أبدًا على أنه معرّف خادم. السجل إمّا ينتظر السجل الأب، أو يفشل برسالة واضحة.
-- **لا فقدان للبيانات:** العمليات الفاشلة تُحفظ ولا تُحذف، حتى تعيد المحاولة أو تصحح البيانات أو تتجاهلها. فترات انقطاع الإنترنت لا تستهلك محاولات إعادة الإرسال.
-- **تسليم مرة واحدة فقط** عبر مفتاح idempotency يُرسل مع كل عملية، مع معالجة حالة «السجل موجود مسبقًا ← اعتمده».
-- **الدمج (Coalescing):** إنشاء ثم تعديل يُرسلان كعملية إنشاء واحدة، وإنشاء ثم حذف لا يُرسل شيئًا.
-- **سحب قابل للاستئناف:** صفحةً بصفحة مع مؤشر (cursor) محفوظ. تُسحب الجداول الأب أولًا، وتُحوّل معرّفات الخادم إلى معرّفات محلية، وتمرّ التعارضات على محلّل قابل للتخصيص.
-- **مزامنة تلقائية** بعد الكتابة (مع تأخير بسيط لتجميع التغييرات)، وعند عودة الاتصال، وعند عودة التطبيق إلى الواجهة، ودوريًا، وعند الطلب. تعمل عملية مزامنة واحدة في كل مرة.
-- **حالة للواجهة:** `ValueListenable<SyncStatus>`، وحالة لكل سجل، وتدفق أحداث.
-- **بلا اعتماديات إلزامية:** استخدم drift أو sqflite أو أي SQLite للتخزين، و http أو dio أو غيرهما للشبكة.
+- **Dependency-aware push** — a bill never reaches the server before its
+  customer, nor a customer before its account. Local ids inside references are
+  rewritten to server ids automatically, in a single sync.
+- **No guessing** — a local id with no server id yet is never sent as if it
+  were one. A record either waits for its parent or fails with a clear
+  message.
+- **No data loss** — failed operations are kept, never dropped, until you
+  retry, fix the data, or discard them. Time spent offline never burns a retry
+  attempt.
+- **Exactly-once delivery** via an idempotency key sent with every operation,
+  plus "already exists → adopt" handling.
+- **Coalescing** — create then update collapses into a single create; create
+  then delete sends nothing at all.
+- **Resumable pull** — page by page, with a saved cursor. Parent tables are
+  pulled first, server ids are converted to local ids, and conflicts go
+  through a resolver you can customize.
+- **Automatic sync** — after writes (briefly debounced to batch bursts), on
+  reconnect, when the app returns to the foreground, periodically, and on
+  demand. Only one sync run at a time.
+- **UI-ready state** — a `ValueListenable<SyncStatus>`, per-record state, and
+  an event stream.
+- **No mandatory dependencies** — use drift, sqflite, or any SQLite for
+  storage, and `http`, `dio`, or anything else for the network.
 
-## كيف تعمل
-
-</div>
+## How it works
 
 ```
  UI ──reads/writes──▶ your local DB ──(same transaction)──▶ sync outbox
@@ -30,23 +46,19 @@
                         SyncEngine ◀────────── pull pages ──── server
 ```
 
-<div dir="rtl">
+For each entity (table) you provide:
 
-لكل كيان (جدول) تقدّم:
-
-| الجزء | وظيفته |
+| Part | Responsibility |
 |---|---|
-| `RemoteAdapter` | يرفع تغييرًا واحدًا ويسحب صفحة واحدة. يغطي `RestRemoteAdapter` معظم واجهات REST. |
-| `LocalAdapter` | يكتب السجل المسحوب في جدولك ويستقبل معرّفات الخادم. |
-| `SyncReference` | يحدد أي الحقول تشير إلى أي كيان (`customerId → customers`، `items[].itemId → items`). |
+| `RemoteAdapter` | Pushes one change and pulls one page. `RestRemoteAdapter` covers most REST APIs. |
+| `LocalAdapter` | Writes a pulled record into your table and receives server ids. |
+| `SyncReference` | Declares which fields point at which entity (`customerId → customers`, `items[].itemId → items`). |
 
-## البدء السريع
-
-</div>
+## Getting started
 
 ```dart
 final sync = SyncEngine(
-  store: SqlSyncStore(DriftSqlExecutor(db)), // أو InMemorySyncStore()
+  store: SqlSyncStore(DriftSqlExecutor(db)), // or InMemorySyncStore()
   connectivity: StreamConnectivity(
     initial: await InternetConnection().hasInternetAccess,
     changes: InternetConnection().onStatusChange
@@ -81,11 +93,10 @@ final sync = SyncEngine(
 await sync.start();
 ```
 
-<div dir="rtl">
+See [`example/`](example) for a complete, runnable app (no backend required —
+it simulates one in memory).
 
-سجّل كل عملية كتابة محلية، داخل نفس المعاملة (transaction) التي تكتب فيها السجل:
-
-</div>
+Record every local write inside the same transaction that writes the row:
 
 ```dart
 await db.transaction(() async {
@@ -93,35 +104,35 @@ await db.transaction(() async {
   await sync.recordCreate('customers', id, customer.toJson());
 });
 
-await sync.recordUpdate('customers', id, {'phone': '0100...'}); // يكفي إرسال الحقول المعدّلة
+await sync.recordUpdate('customers', id, {'phone': '0100...'}); // changed fields are enough
 await sync.recordDelete('customers', id);
 ```
 
-<div dir="rtl">
+That's it. The engine pushes the change moments later, or as soon as
+connectivity returns.
 
-هذا كل شيء. يرفع المحرّك التغييرات بعد لحظات، أو عند عودة الاتصال.
+### Reference fields hold local ids
 
-### حقول المراجع تحمل المعرّفات المحلية
+Inside your database, and in the data you record, a reference field always
+holds the **local id** of the referenced record. The engine converts it to a
+server id when pushing, and server ids back to local ids when pulling. Never
+store a server id in a reference column: mixing the two is exactly what makes
+records attach to the wrong parent.
 
-داخل قاعدة بياناتك وفي البيانات التي تسجّلها، يحمل حقل المرجع دائمًا **المعرّف المحلي** للسجل المُشار إليه.
-يحوّله المحرّك إلى معرّف الخادم عند الرفع، ويحوّل معرّفات الخادم إلى محلية عند السحب.
-لا تخزّن أبدًا معرّف خادم في عمود مرجع: هذا الخلط هو بالضبط ما يجعل السجلات ترتبط بالأب الخطأ.
+The safest local ids are UUIDs from `SyncEngine.newLocalId()`, but
+auto-incrementing integers work too.
 
-أكثر المعرّفات المحلية أمانًا هي UUID عبر `SyncEngine.newLocalId()`، لكن المعرّفات الرقمية ذات الزيادة التلقائية تعمل أيضًا.
-
-## عرض الحالة
-
-</div>
+## Showing status
 
 ```dart
 SyncStatusBuilder(
   engine: sync,
   builder: (context, s) => switch (s.phase) {
-    SyncPhase.offline => const Text('غير متصل – يتم حفظ التغييرات محليًا'),
-    SyncPhase.authRequired => const Text('انتهت الجلسة، سجّل الدخول مجددًا'),
-    _ when s.failedCount > 0 => Text('${s.failedCount} عملية تحتاج مراجعة'),
-    _ when s.pendingCount > 0 => Text('${s.pendingCount} بانتظار الرفع'),
-    _ => const Text('تمت المزامنة'),
+    SyncPhase.offline => const Text('Offline – changes are saved locally'),
+    SyncPhase.authRequired => const Text('Session expired, please sign in again'),
+    _ when s.failedCount > 0 => Text('${s.failedCount} operation(s) need review'),
+    _ when s.pendingCount > 0 => Text('${s.pendingCount} pending upload'),
+    _ => const Text('Synced'),
   },
 );
 
@@ -133,30 +144,23 @@ RecordSyncStateBuilder(
 );
 ```
 
-<div dir="rtl">
-
-تبقى العمليات الفاشلة في الصندوق الصادر مع سبب الفشل:
-
-</div>
+Failed operations stay in the outbox along with their error:
 
 ```dart
 for (final op in await sync.failedOperations()) {
   print('${op.entity}/${op.localId}: ${op.lastError}');
 }
-await sync.retryFailed();          // الكل، أو retryFailed(op.id)
-await sync.discard(op.id);         // التخلي عن تغيير واحد
+await sync.retryFailed();          // all of them, or retryFailed(op.id)
+await sync.discard(op.id);         // give up on one change
 ```
 
-<div dir="rtl">
+Editing a record whose last operation failed merges the fix into that
+operation and re-queues it — the usual case for a validation error the user
+just corrected.
 
-تعديل سجل فشلت آخر عملية له يدمج التصحيح في تلك العملية ويعيدها إلى قائمة الانتظار.
-هذه هي الحالة المعتادة لخطأ تحقق (validation) يصححه المستخدم.
+## Writing adapters
 
-## كتابة المحوّلات (Adapters)
-
-### المحوّل المحلي
-
-</div>
+### Local adapter
 
 ```dart
 class CustomersLocal extends LocalAdapter {
@@ -166,7 +170,7 @@ class CustomersLocal extends LocalAdapter {
   @override
   Future<String> applyRemote(Map<String, dynamic> record,
       {required String? localId, required String serverId}) async {
-    // حقول المراجع في `record` تحمل المعرّفات المحلية مسبقًا.
+    // Reference fields in `record` already hold local ids.
     final row = CustomersCompanion(
       id: localId == null ? const Value.absent() : Value(int.parse(localId)),
       name: Value(record['name']),
@@ -181,14 +185,14 @@ class CustomersLocal extends LocalAdapter {
   Future<void> applyRemoteDelete(String localId, {required String serverId}) =>
       (db.delete(db.customers)..where((c) => c.id.equals(int.parse(localId)))).go();
 
-  // اختياري: تحديث عمود server_id الخاص بك.
+  // Optional: keep your own server_id column up to date.
   @override
   Future<void> onServerIdAssigned(String localId, String serverId,
           {Map<String, dynamic>? serverRecord}) =>
       db.customStatement('UPDATE customers SET server_id = ? WHERE id = ?',
           [int.parse(serverId), int.parse(localId)]);
 
-  // اختياري: سجلات أُنشئت قبل تثبيت flutter_sync.
+  // Optional: records created before flutter_offline_sync was installed.
   @override
   Future<String?> findServerId(String localId) async => (await db
           .customSelect('SELECT server_id FROM customers WHERE id = ?',
@@ -199,21 +203,21 @@ class CustomersLocal extends LocalAdapter {
 }
 ```
 
-<div dir="rtl">
+When one endpoint creates several records at once (e.g. account + profile +
+customer), record that call under one entity with `recordCreate`, then
+declare the others with `recordCreatedVia('customers', id, viaEntity: ...,
+viaLocalId: ...)`. Records that reference them wait until that push
+completes. Afterwards, register the returned ids via `registerMapping`
+inside `onServerIdAssigned`.
 
-عندما تُنشئ نقطة نهاية واحدة عدة سجلات دفعة واحدة (مثل حساب + ملف شخصي + عميل)،
-سجّل كيان هذا الاستدعاء نفسه بـ `recordCreate`، وصرّح بالسجلات الأخرى عبر
-`recordCreatedVia('customers', id, viaEntity: ..., viaLocalId: ...)`.
-السجلات التي تشير إليها تنتظر حتى يكتمل هذا الرفع. بعد ذلك سجّل المعرّفات المُعادة عبر `registerMapping` داخل `onServerIdAssigned`.
+Use `buildPushPayload` to send freshly read data (e.g. a bill with its
+current line items) instead of the payload recorded with the operation.
 
-استخدم `buildPushPayload` لإرسال أحدث البيانات (مثل فاتورة مع بنودها الحالية) بدلًا من البيانات المسجّلة مع العملية.
+### Remote adapter
 
-### المحوّل البعيد
-
-يربط `RestRemoteAdapter` الإنشاء والتعديل والحذف بـ `POST` و `PUT` و `DELETE`، ويرسل ترويسة مفتاح idempotency،
-ويفهم الردود من نوع `{"success": false, "message": ...}` التي تعود مع HTTP 200. طبقة النقل من اختيارك:
-
-</div>
+`RestRemoteAdapter` maps create/update/delete to `POST`/`PUT`/`DELETE`, sends
+an idempotency-key header, and understands `{"success": false, "message":
+...}` responses that come back with HTTP 200. The transport is your choice:
 
 ```dart
 Future<RestResponse> transport(RestRequest r) async {
@@ -231,52 +235,61 @@ Future<RestResponse> transport(RestRequest r) async {
 }
 ```
 
-<div dir="rtl">
+Let transport exceptions (`SocketException`, `TimeoutException`,
+`ClientException`) propagate as-is. The engine treats them as "offline" and
+does not count them as an attempt. **Do not** turn them into fake HTTP
+responses.
 
-اترك استثناءات النقل (`SocketException` و `TimeoutException` و `ClientException`) تمرّ كما هي.
-يعتبرها المحرّك «غير متصل» ولا يحسبها محاولة. **لا** تحوّلها إلى ردود HTTP وهمية.
+For any unusual API, implement `RemoteAdapter` directly and return a
+`PushOutcome`:
 
-لأي واجهة غير معتادة، نفّذ `RemoteAdapter` مباشرة وأعد `PushOutcome`:
-
-| النتيجة | متى | الأثر |
+| Outcome | When | Effect |
 |---|---|---|
-| `success(serverId:)` | قُبل التغيير (أو موجود مسبقًا مع معرّفه) | تُحذف العملية ويُربط المعرّف |
-| `networkError` | الخادم غير قابل للوصول | تتوقف المزامنة دون احتساب محاولة |
-| `retry` | 5xx أو 429 أو انتهاء المهلة | تأخير متزايد ثم إعادة، وتُحتسب محاولة |
-| `rejected` | خطأ تحقق | تُعلَّم العملية فاشلة، والسجلات التابعة تنتظر |
-| `conflict` | لدى الخادم نسخة أحدث | يقرر محلّل التعارض |
-| `unauthorized` | انتهت صلاحية الرمز | تتوقف المزامنة، `SyncPhase.authRequired` |
+| `success(serverId:)` | Change accepted (or already existed, with its id) | Operation is removed and the id is mapped |
+| `networkError` | Server unreachable | Sync stops without counting an attempt |
+| `retry` | 5xx, 429, or timeout | Backoff then retry; counts as an attempt |
+| `rejected` | Validation error | Operation is marked failed; dependent records wait |
+| `conflict` | Server holds a newer version | The conflict resolver decides |
+| `unauthorized` | Token expired | Sync stops, `SyncPhase.authRequired` |
 
-### مخزن SQL
+### SQL store
 
-ينشئ `SqlSyncStore` ثلاثة جداول (`sync_outbox` و `sync_id_map` و `sync_meta`) باستخدام `IF NOT EXISTS`،
-فلا يحتاج مخططك إلى أي ترحيل (migration). ضعه في نفس قاعدة بيانات بياناتك ليُحفظ السجل وعمليته في الصندوق الصادر معًا.
+`SqlSyncStore` creates three tables (`sync_outbox`, `sync_id_map`,
+`sync_meta`) using `IF NOT EXISTS`, so your schema needs no migration. Put it
+in the same database as your data so a record and its operation are saved to
+the outbox together.
 
-- **drift:** راجع تعليق التوثيق في `SqlExecutor`، خمسة أسطر فقط.
-- **sqflite:** وجّه الاستعلامات إلى المعاملة المفتوحة عبر Zone. راجع `SqfliteExecutor` في `test/sql_store_test.dart`.
+Implement `SqlExecutor` on top of your database — see its doc comment for a
+five-line `drift` example. For `sqflite`, route queries to the currently open
+transaction (`Database.transaction`'s callback) via a `Zone` so writes inside
+`SqlSyncStore.transaction` land in the same transaction as your own.
 
-## السحب
+## Pulling
 
-| `PullMode` | متى تستخدمه |
+| `PullMode` | When to use it |
 |---|---|
-| `incremental` | عندما تدعم الواجهة الفلترة بوقت التعديل. استخدمه مع `UpdatedSincePagination`، ويبقى المؤشر محفوظًا بعد إعادة التشغيل. |
-| `fullRefresh` | عندما لا تدعم الواجهة إلا التصفح الكامل. استخدمه مع `PagePagination`. يستقبل `LocalAdapter.onFullRefreshComplete` كل معرّفات الخادم التي ظهرت، لتحذف السجلات المحذوفة من الخادم. |
-| `none` | كيانات للرفع فقط |
+| `incremental` | The API supports filtering by modification time. Pair it with `UpdatedSincePagination`; the cursor survives restarts. |
+| `fullRefresh` | The API only supports full listing. Pair it with `PagePagination`. `LocalAdapter.onFullRefreshComplete` receives every server id seen, so you can delete rows the server no longer has. |
+| `none` | Push-only entities |
 
-تُسحب الكيانات الأب أولًا، بترتيب مستنتج من `references` و `dependsOn`. ترتيب التسجيل لا يهم.
+Parent entities are pulled first, in an order inferred from `references` and
+`dependsOn`. Registration order does not matter.
 
-## التعارضات
+## Conflicts
 
-التعارض هو سجل مسحوب ما زالت نسخته المحلية تحمل تغييرات لم تُرفع، أو عملية رفع ردّ عليها الخادم بـ `conflict`.
+A conflict is a pulled record whose local copy still has unpushed changes, or
+a push that the server answered with `conflict`.
 
-- `ConflictStrategy.keepLocal` (الافتراضي): يفوز تغيير الجهاز ويُرفع.
-- `ConflictStrategy.serverWins`: تُعتمد نسخة الخادم ويُلغى التغيير المحلي.
-- `ConflictStrategy.lastWriteWins`: يقارن `updatedAtOf(record)` بوقت التغيير المحلي.
-- `conflictResolver: (c) => ConflictResolution.merge({...})` للدمج على مستوى الحقول.
+- `ConflictStrategy.keepLocal` (default): the device's change wins and is
+  pushed.
+- `ConflictStrategy.serverWins`: the server's copy is adopted and the local
+  change is discarded.
+- `ConflictStrategy.lastWriteWins`: compares `updatedAtOf(record)` against the
+  local change's timestamp.
+- `conflictResolver: (c) => ConflictResolution.merge({...})` for field-level
+  merging.
 
-## الإعدادات
-
-</div>
+## Configuration
 
 ```dart
 SyncConfig(
@@ -291,20 +304,25 @@ SyncConfig(
 );
 ```
 
-<div dir="rtl">
+Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushEnabled`,
+`coalesce`, `mergePayload`, `serverIdOf`, `updatedAtOf`, `isDeletedOf` (for
+server-deleted records), and `unknownReferencePolicy`.
 
-من إعدادات كل كيان في `SyncEntityConfig`: `pullPageSize` و `pushEnabled` و `coalesce` و `mergePayload`
-و `serverIdOf` و `updatedAtOf` و `isDeletedOf` (للسجلات المحذوفة من الخادم) و `unknownReferencePolicy`.
+## Migrating an existing app
 
-## ترحيل تطبيق قائم
+1. Register existing rows once:
+   `await sync.registerMapping('customers', row.id, row.serverId)`, or
+   implement `LocalAdapter.findServerId`/`findLocalId` to read a `server_id`
+   column on demand.
+2. Enqueue rows that were never pushed (`is_sync = 0`) via
+   `recordCreate`/`recordUpdate`.
+3. Route every create, update and delete in the app through the local
+   database with `record*`, and remove the "if online call the API, else
+   save locally" branches.
+4. Replace a manual "sync everything" screen with `sync.syncNow()` and
+   `SyncStatusBuilder`.
 
-1. سجّل الصفوف الموجودة مرة واحدة:
-   `await sync.registerMapping('customers', row.id, row.serverId)`،
-   أو نفّذ `LocalAdapter.findServerId`/`findLocalId` لقراءة عمود `server_id` عند الحاجة.
-2. أضف إلى قائمة الانتظار الصفوف التي لم تُرفع قط (`is_sync = 0`) عبر `recordCreate`/`recordUpdate`.
-3. مرّر كل عمليات الإنشاء والتعديل والحذف في التطبيق عبر قاعدة البيانات المحلية مع `record*`،
-   واحذف منطق «إن كان متصلًا استدعِ الـ API، وإلا احفظ محليًا».
-4. استبدل شاشة «مزامنة كل شيء» اليدوية بـ `sync.syncNow()` مع `SyncStatusBuilder`.
+## Additional information
 
-
-</div>
+Issues and pull requests are welcome on
+[GitHub](https://github.com/ahmedalgarbani/flutter_offline_sync).
