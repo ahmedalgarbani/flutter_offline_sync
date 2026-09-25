@@ -5,7 +5,8 @@ description: >-
   resolution and status streams. Storage- and backend-agnostic.
 version: 0.1.0
 publish_to: none
-homepage: https://github.com/abdelrahman-saad1/flutter_offline_sync
+homepage: https://github.com/ahmedalgarbani/flutter_offline_sync
+repository: https://github.com/ahmedalgarbani/flutter_offline_sync
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
