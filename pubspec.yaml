@@ -1,4 +1,4 @@
-name: flutter_offline_sync
+name: flutter_offline_first_sync
 description: >-
   Offline-first sync engine for Flutter: durable outbox, dependency-aware
   push with id remapping, resumable pull, retries, conflict resolution, and

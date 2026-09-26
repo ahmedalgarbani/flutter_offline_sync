@@ -1,4 +1,4 @@
-// Minimal, self-contained demo of flutter_offline_sync.
+// Minimal, self-contained demo of flutter_offline_first_sync.
 //
 // There is no real backend here: a `Map` stands in for the server so the
 // example runs with nothing to configure. In a real app, replace the
@@ -6,7 +6,7 @@
 // `RemoteAdapter`) and the `CallbackLocalAdapter` with writes into your own
 // database (sqflite, drift, Isar, ...).
 import 'package:flutter/material.dart';
-import 'package:flutter_offline_sync/flutter_offline_sync.dart';
+import 'package:flutter_offline_first_sync/flutter_offline_first_sync.dart';
 
 void main() => runApp(const ExampleApp());
 
@@ -16,7 +16,7 @@ class ExampleApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'flutter_offline_sync example',
+      title: 'flutter_offline_first_sync example',
       home: const NotesPage(),
     );
   }
@@ -109,7 +109,7 @@ class _NotesPageState extends State<NotesPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('flutter_offline_sync example'),
+        title: const Text('flutter_offline_first_sync example'),
       ),
       body: Column(
         children: [

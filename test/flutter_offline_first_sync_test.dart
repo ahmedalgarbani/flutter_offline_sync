@@ -1,4 +1,4 @@
-import 'package:flutter_offline_sync/flutter_offline_sync.dart';
+import 'package:flutter_offline_first_sync/flutter_offline_first_sync.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

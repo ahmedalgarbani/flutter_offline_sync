@@ -1,5 +1,5 @@
-name: flutter_offline_sync_example
-description: Example app for the flutter_offline_sync package.
+name: flutter_offline_first_sync_example
+description: Example app for the flutter_offline_first_sync package.
 publish_to: none
 version: 1.0.0
 
@@ -10,7 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_offline_sync:
+  flutter_offline_first_sync:
     path: ../
 
 dev_dependencies:
