@@ -1,12 +1,12 @@
-# flutter_offline_sync
+# flutter_offline_first_sync
 
-[![pub package](https://img.shields.io/pub/v/flutter_offline_sync.svg)](https://pub.dev/packages/flutter_offline_sync)
+[![pub package](https://img.shields.io/pub/v/flutter_offline_first_sync.svg)](https://pub.dev/packages/flutter_offline_first_sync)
 [![license](https://img.shields.io/github/license/ahmedalgarbani/flutter_offline_sync.svg)](LICENSE)
 
 An **offline-first** sync engine for Flutter that works with the database and
 backend you already have.
 
-Your app **always reads and writes its local database**. `flutter_offline_sync`
+Your app **always reads and writes its local database**. `flutter_offline_first_sync`
 records every change in a durable outbox and sends it to the server when
 possible, in the right order, exactly once. It also pulls server changes down
 without overwriting edits that have not been pushed yet.
@@ -192,7 +192,7 @@ class CustomersLocal extends LocalAdapter {
       db.customStatement('UPDATE customers SET server_id = ? WHERE id = ?',
           [int.parse(serverId), int.parse(localId)]);
 
-  // Optional: records created before flutter_offline_sync was installed.
+  // Optional: records created before flutter_offline_first_sync was installed.
   @override
   Future<String?> findServerId(String localId) async => (await db
           .customSelect('SELECT server_id FROM customers WHERE id = ?',
