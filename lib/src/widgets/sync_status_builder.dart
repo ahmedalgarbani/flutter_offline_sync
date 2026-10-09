@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 
 import '../core/status.dart';
@@ -33,8 +35,11 @@ class SyncStatusBuilder extends StatelessWidget {
   }
 }
 
-/// Shows the [RecordSyncState] of one record and refreshes after each run
-/// and each recorded write.
+/// Shows the [RecordSyncState] of one record and keeps it current.
+///
+/// Built on [SyncEngine.watchRecordState]: the state is re-read only when an
+/// event concerns this record or a run ends, so it is cheap to use on every
+/// row of a long list.
 class RecordSyncStateBuilder extends StatefulWidget {
   const RecordSyncStateBuilder({
     super.key,
@@ -55,38 +60,39 @@ class RecordSyncStateBuilder extends StatefulWidget {
 
 class _RecordSyncStateBuilderState extends State<RecordSyncStateBuilder> {
   RecordSyncState _state = RecordSyncState.synced;
+  StreamSubscription<RecordSyncState>? _subscription;
 
   @override
   void initState() {
     super.initState();
-    widget.engine.status.addListener(_reload);
-    _reload();
+    _subscribe();
   }
 
   @override
   void didUpdateWidget(RecordSyncStateBuilder oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.engine != widget.engine) {
-      oldWidget.engine.status.removeListener(_reload);
-      widget.engine.status.addListener(_reload);
-    }
     if (oldWidget.engine != widget.engine ||
         oldWidget.entity != widget.entity ||
         oldWidget.localId != widget.localId) {
-      _reload();
+      _subscription?.cancel();
+      _subscribe();
     }
+  }
+
+  void _subscribe() {
+    _subscription = widget.engine
+        .watchRecordState(widget.entity, widget.localId)
+        .listen((state) {
+      if (mounted && state != _state) setState(() => _state = state);
+    }, onError: (Object error, StackTrace stackTrace) {
+      // Keep the last known state; the next event reads it again.
+    });
   }
 
   @override
   void dispose() {
-    widget.engine.status.removeListener(_reload);
+    _subscription?.cancel();
     super.dispose();
-  }
-
-  Future<void> _reload() async {
-    final state =
-        await widget.engine.recordState(widget.entity, widget.localId);
-    if (mounted && state != _state) setState(() => _state = state);
   }
 
   @override

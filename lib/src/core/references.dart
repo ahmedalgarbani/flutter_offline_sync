@@ -112,7 +112,7 @@ class _Segment {
 }
 
 /// Deep-copies JSON-like data (maps, lists, primitives).
-Map<String, dynamic> deepCopyJson(Map json) {
+Map<String, dynamic> deepCopyJson(Map<Object?, Object?> json) {
   return json.map((key, value) => MapEntry(key.toString(), _copy(value)));
 }
 

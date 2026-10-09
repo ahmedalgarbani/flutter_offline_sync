@@ -32,11 +32,16 @@ class AlwaysOnline implements ConnectivitySource {
 class StreamConnectivity implements ConnectivitySource {
   StreamConnectivity({required bool initial, required Stream<bool> changes})
       : _isOnline = initial {
-    _subscription = changes.listen((value) {
-      if (value == _isOnline) return;
-      _isOnline = value;
-      _controller.add(value);
-    });
+    _subscription = changes.listen(
+      (value) {
+        if (value == _isOnline) return;
+        _isOnline = value;
+        _controller.add(value);
+      },
+      // A failing connectivity plugin must not crash the app: keep the last
+      // known value. Network errors still put the engine offline.
+      onError: (Object error, StackTrace stackTrace) {},
+    );
   }
 
   bool _isOnline;
@@ -71,6 +76,8 @@ class ManualConnectivity implements ConnectivitySource {
   set online(bool value) {
     if (value == _isOnline) return;
     _isOnline = value;
-    _controller.add(value);
+    if (!_controller.isClosed) _controller.add(value);
   }
+
+  Future<void> dispose() => _controller.close();
 }

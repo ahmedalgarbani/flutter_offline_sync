@@ -44,6 +44,7 @@ class SyncEntityConfig {
     this.references = const [],
     this.dependsOn = const [],
     this.serverIdOf = _defaultServerIdOf,
+    this.serverIdToJson,
     this.updatedAtOf,
     this.isDeletedOf,
     this.pullMode = PullMode.incremental,
@@ -74,6 +75,14 @@ class SyncEntityConfig {
 
   /// Reads the server id from a server record. Defaults to `id`.
   final Object? Function(Map<String, dynamic> record) serverIdOf;
+
+  /// Writes a server id of this entity into the reference fields of pushed
+  /// payloads. By default the JSON type of the local value is kept: an int
+  /// local id becomes an int server id, a string stays a string.
+  ///
+  /// Set `serverIdToJson: int.parse` when local ids are strings (such as the
+  /// UUIDs from `SyncEngine.newLocalId`) but the server expects numbers.
+  final Object Function(String serverId)? serverIdToJson;
 
   /// Reads the server's last-modified time (used by last-write-wins).
   final DateTime? Function(Map<String, dynamic> record)? updatedAtOf;

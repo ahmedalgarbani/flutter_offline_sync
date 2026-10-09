@@ -16,6 +16,9 @@ enum SyncPhase {
 }
 
 /// Snapshot of the engine state for the UI.
+///
+/// Two snapshots with the same values are equal, so listeners are only
+/// notified when something they can show actually changed.
 class SyncStatus {
   const SyncStatus({
     this.phase = SyncPhase.idle,
@@ -25,6 +28,7 @@ class SyncStatus {
     this.currentEntity,
     this.lastSyncedAt,
     this.lastError,
+    this.nextRetryAt,
   });
 
   final SyncPhase phase;
@@ -39,10 +43,16 @@ class SyncStatus {
   /// Entity being pushed or pulled.
   final String? currentEntity;
 
-  /// End of the last run that pushed and pulled without being cut short.
+  /// End of the last run that was not cut short (by being offline,
+  /// unauthorized, paused or an unexpected error).
   final DateTime? lastSyncedAt;
 
   final String? lastError;
+
+  /// When the first operation waiting out a backoff delay (after a
+  /// temporary failure) becomes due. A started engine retries it at that
+  /// time by itself. Null when no operation is backing off.
+  final DateTime? nextRetryAt;
 
   bool get isSyncing =>
       phase == SyncPhase.pushing || phase == SyncPhase.pulling;
@@ -60,6 +70,8 @@ class SyncStatus {
     DateTime? lastSyncedAt,
     String? lastError,
     bool clearLastError = false,
+    DateTime? nextRetryAt,
+    bool clearNextRetryAt = false,
   }) {
     return SyncStatus(
       phase: phase ?? this.phase,
@@ -70,8 +82,26 @@ class SyncStatus {
           clearCurrentEntity ? null : (currentEntity ?? this.currentEntity),
       lastSyncedAt: lastSyncedAt ?? this.lastSyncedAt,
       lastError: clearLastError ? null : (lastError ?? this.lastError),
+      nextRetryAt: clearNextRetryAt ? null : (nextRetryAt ?? this.nextRetryAt),
     );
   }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SyncStatus &&
+          other.phase == phase &&
+          other.isOnline == isOnline &&
+          other.pendingCount == pendingCount &&
+          other.failedCount == failedCount &&
+          other.currentEntity == currentEntity &&
+          other.lastSyncedAt == lastSyncedAt &&
+          other.lastError == lastError &&
+          other.nextRetryAt == nextRetryAt;
+
+  @override
+  int get hashCode => Object.hash(phase, isOnline, pendingCount, failedCount,
+      currentEntity, lastSyncedAt, lastError, nextRetryAt);
 
   @override
   String toString() => 'SyncStatus(${phase.name}, online: $isOnline, '
@@ -100,8 +130,9 @@ class SyncRunResult {
   int pushed = 0;
   int failed = 0;
 
-  /// Operations skipped this run: waiting for a parent, for backoff, or for
-  /// an earlier operation of the same record.
+  /// Operations left pending by the run: waiting for a parent, for a
+  /// backoff delay, for an earlier operation of the same record, or for the
+  /// connection to come back.
   int waiting = 0;
   int pulled = 0;
   final List<String> errors = [];
@@ -132,12 +163,36 @@ class SyncEvent {
 }
 
 enum SyncEventType {
+  /// A run started.
   runStarted,
+
+  /// A run ended; [SyncEvent.message] summarizes its [SyncRunResult].
   runFinished,
+
+  /// A local change was recorded (or merged into a queued one).
   operationRecorded,
+
+  /// The server accepted a change; [SyncEvent.message] is the server id.
   operationPushed,
+
+  /// A change was marked failed; [SyncEvent.message] is the error.
   operationFailed,
+
+  /// A failed change was queued again by `retryFailed`.
+  operationRetried,
+
+  /// A change was removed by `discard`.
+  operationDiscarded,
+
+  /// A server record was written locally.
   recordPulled,
+
+  /// The server deleted a record and the local copy was removed.
   recordDeletedByServer,
+
+  /// A conflict resolver decided; [SyncEvent.message] names the decision.
   conflictResolved,
+
+  /// `SyncEngine.clear` wiped the outbox, id map and cursors.
+  storeCleared,
 }

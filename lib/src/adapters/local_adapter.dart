@@ -65,16 +65,21 @@ class CallbackLocalAdapter extends LocalAdapter {
     Future<void> Function(String localId, String serverId,
             {Map<String, dynamic>? serverRecord})?
         onServerIdAssigned,
+    Future<void> Function(SyncOperation operation, {String? serverId})?
+        onPushed,
     Future<Map<String, dynamic>?> Function(SyncOperation operation)?
         buildPushPayload,
     Future<String?> Function(String localId)? findServerId,
     Future<String?> Function(String serverId)? findLocalId,
+    Future<void> Function(Set<String> serverIds)? onFullRefreshComplete,
   })  : _applyRemote = applyRemote,
         _applyRemoteDelete = applyRemoteDelete,
         _onServerIdAssigned = onServerIdAssigned,
+        _onPushed = onPushed,
         _buildPushPayload = buildPushPayload,
         _findServerId = findServerId,
-        _findLocalId = findLocalId;
+        _findLocalId = findLocalId,
+        _onFullRefreshComplete = onFullRefreshComplete;
 
   final Future<String> Function(
     Map<String, dynamic> record, {
@@ -85,10 +90,13 @@ class CallbackLocalAdapter extends LocalAdapter {
       _applyRemoteDelete;
   final Future<void> Function(String localId, String serverId,
       {Map<String, dynamic>? serverRecord})? _onServerIdAssigned;
+  final Future<void> Function(SyncOperation operation, {String? serverId})?
+      _onPushed;
   final Future<Map<String, dynamic>?> Function(SyncOperation operation)?
       _buildPushPayload;
   final Future<String?> Function(String localId)? _findServerId;
   final Future<String?> Function(String serverId)? _findLocalId;
+  final Future<void> Function(Set<String> serverIds)? _onFullRefreshComplete;
 
   @override
   Future<String> applyRemote(
@@ -113,6 +121,10 @@ class CallbackLocalAdapter extends LocalAdapter {
       Future.value();
 
   @override
+  Future<void> onPushed(SyncOperation operation, {String? serverId}) =>
+      _onPushed?.call(operation, serverId: serverId) ?? Future.value();
+
+  @override
   Future<Map<String, dynamic>?> buildPushPayload(SyncOperation operation) =>
       _buildPushPayload?.call(operation) ?? Future.value();
 
@@ -123,4 +135,8 @@ class CallbackLocalAdapter extends LocalAdapter {
   @override
   Future<String?> findLocalId(String serverId) =>
       _findLocalId?.call(serverId) ?? Future.value();
+
+  @override
+  Future<void> onFullRefreshComplete(Set<String> serverIds) =>
+      _onFullRefreshComplete?.call(serverIds) ?? Future.value();
 }
