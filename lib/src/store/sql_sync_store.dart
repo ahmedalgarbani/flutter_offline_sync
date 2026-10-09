@@ -99,9 +99,10 @@ class SqlSyncStore implements SyncStore {
 
   @override
   Future<T> transaction<T>(Future<T> Function() action) {
-    if (Zone.current[_txKey] == true) return action();
+    // Nested calls join the transaction of this store that is already open.
+    if (identical(Zone.current[_txKey], this)) return action();
     return executor
-        .transaction(() => runZoned(action, zoneValues: {_txKey: true}));
+        .transaction(() => runZoned(action, zoneValues: {_txKey: this}));
   }
 
   @override
@@ -237,9 +238,9 @@ class SqlSyncStore implements SyncStore {
   }
 
   @override
-  Future<void> clear() async {
-    await executor.execute('DELETE FROM $_outbox');
-    await executor.execute('DELETE FROM $_idMap');
-    await executor.execute('DELETE FROM $_meta');
-  }
+  Future<void> clear() => transaction(() async {
+        await executor.execute('DELETE FROM $_outbox');
+        await executor.execute('DELETE FROM $_idMap');
+        await executor.execute('DELETE FROM $_meta');
+      });
 }

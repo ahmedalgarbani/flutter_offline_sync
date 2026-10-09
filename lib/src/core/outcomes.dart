@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'operation.dart';
 
 /// What the remote adapter is asked to send.
@@ -162,25 +164,55 @@ class SyncRejectedException implements Exception {
 
 /// Default mapping from a thrown error to an outcome.
 ///
-/// Recognizes the exceptions above, plus common transport errors by type
-/// name (`SocketException`, `ClientException`, `TimeoutException`, ...), so
-/// the package does not need `dart:io` and still works on the web.
+/// Recognizes the exceptions above and transport failures (see
+/// [isNetworkError]). Anything else is treated as a temporary failure and
+/// retried with backoff.
 PushOutcome defaultClassifyError(Object error) {
   if (error is SyncNetworkException) return PushOutcome.networkError(error);
   if (error is SyncUnauthorizedException) {
     return PushOutcome.unauthorized(error);
   }
   if (error is SyncRejectedException) return PushOutcome.rejected(error);
-  const networkTypes = {
-    'SocketException',
-    'ClientException',
-    'HandshakeException',
-    'HttpException',
-    'TimeoutException',
-    'WebSocketException',
-  };
-  if (networkTypes.contains(error.runtimeType.toString())) {
-    return PushOutcome.networkError(error);
-  }
+  if (isNetworkError(error)) return PushOutcome.networkError(error);
   return PushOutcome.retry(error);
 }
+
+/// True when [error] means the server could not be reached:
+/// [SyncNetworkException], [TimeoutException], `dart:io`'s
+/// `SocketException`, `HttpException` and `HandshakeException`,
+/// `package:http`'s `ClientException`, WebSocket errors, and dio's
+/// connection and timeout errors.
+///
+/// Errors are matched by name, so the package needs neither `dart:io` nor an
+/// HTTP client. The message is checked as well as the type: release web
+/// builds minify type names, and some clients throw private subclasses
+/// (`package:http` wraps socket errors in one).
+bool isNetworkError(Object error) {
+  if (error is SyncNetworkException || error is TimeoutException) {
+    return true;
+  }
+  if (_networkErrorTypes.contains(error.runtimeType.toString())) return true;
+  final message = error.toString();
+  return _networkErrorMessage.hasMatch(message) ||
+      _dioNetworkErrors.any(message.startsWith);
+}
+
+const _networkErrorTypes = {
+  'SocketException',
+  'ClientException',
+  'HandshakeException',
+  'HttpException',
+  'WebSocketException',
+  'WebSocketChannelException',
+};
+
+final _networkErrorMessage = RegExp(r'^(SocketException|ClientException|'
+    r'HandshakeException|HttpException|WebSocketException|'
+    r'WebSocketChannelException)\b');
+
+const _dioNetworkErrors = [
+  'DioException [connection timeout]',
+  'DioException [connection error]',
+  'DioException [send timeout]',
+  'DioException [receive timeout]',
+];
