@@ -19,7 +19,8 @@ without overwriting edits that have not been pushed yet.
   message.
 - **No data loss** — failed operations are kept, never dropped, until you
   retry, fix the data, or discard them. Time spent offline never burns a retry
-  attempt.
+  attempt, and temporary failures are retried by themselves once their
+  backoff delay ends.
 - **Exactly-once delivery** via an idempotency key sent with every operation,
   plus "already exists → adopt" handling.
 - **Coalescing** — create then update collapses into a single create; create
@@ -28,10 +29,12 @@ without overwriting edits that have not been pushed yet.
   pulled first, server ids are converted to local ids, and conflicts go
   through a resolver you can customize.
 - **Automatic sync** — after writes (briefly debounced to batch bursts), on
-  reconnect, when the app returns to the foreground, periodically, and on
-  demand. Only one sync run at a time.
-- **UI-ready state** — a `ValueListenable<SyncStatus>`, per-record state, and
-  an event stream.
+  reconnect, when the app returns to the foreground, periodically, when a
+  backoff delay ends, and on demand. Only one sync run at a time; requests
+  made during a run are merged into a single follow-up run, so nothing is
+  lost.
+- **UI-ready state** — a `ValueListenable<SyncStatus>`, per-record state
+  streams, and an event stream.
 - **No mandatory dependencies** — use drift, sqflite, or any SQLite for
   storage, and `http`, `dio`, or anything else for the network.
 
@@ -120,7 +123,14 @@ store a server id in a reference column: mixing the two is exactly what makes
 records attach to the wrong parent.
 
 The safest local ids are UUIDs from `SyncEngine.newLocalId()`, but
-auto-incrementing integers work too.
+auto-incrementing integers work too. A server id written into a reference
+keeps the JSON type of the local value it replaces; with string (UUID) local
+ids and a server that expects numbers, set `serverIdToJson: int.parse` on the
+referenced entity:
+
+```dart
+SyncEntityConfig(name: 'customers', serverIdToJson: int.parse, /* ... */)
+```
 
 ## Showing status
 
@@ -144,6 +154,13 @@ RecordSyncStateBuilder(
 );
 ```
 
+`RecordSyncStateBuilder` only re-reads a record's state when an event
+concerns that record or a run ends, so it is cheap on every row of a long
+list. The same stream is available as `sync.watchRecordState(entity, id)`.
+
+`SyncStatus.nextRetryAt` tells when operations that hit a temporary failure
+(5xx, 429, timeout) will be retried — automatically, no trigger needed.
+
 Failed operations stay in the outbox along with their error:
 
 ```dart
@@ -152,11 +169,20 @@ for (final op in await sync.failedOperations()) {
 }
 await sync.retryFailed();          // all of them, or retryFailed(op.id)
 await sync.discard(op.id);         // give up on one change
+
+// Why has this bill not synced yet?
+final ops = await sync.operationsOf('bills', bill.id);
+final reason = ops.isEmpty ? null : ops.last.lastError;
 ```
 
-Editing a record whose last operation failed merges the fix into that
-operation and re-queues it — the usual case for a validation error the user
-just corrected.
+Editing a record whose operation failed merges the fix into the queued
+change and re-queues it with a fresh attempt budget — the usual case for a
+validation error the user just corrected.
+
+`sync.events` reports what happens (`operationRecorded`, `operationPushed`,
+`operationFailed`, `operationRetried`, `operationDiscarded`, `recordPulled`,
+`recordDeletedByServer`, `conflictResolved`, `runStarted`, `runFinished`,
+`storeCleared`), for logging or refreshing a screen.
 
 ## Writing adapters
 
@@ -217,7 +243,26 @@ current line items) instead of the payload recorded with the operation.
 
 `RestRemoteAdapter` maps create/update/delete to `POST`/`PUT`/`DELETE`, sends
 an idempotency-key header, and understands `{"success": false, "message":
-...}` responses that come back with HTTP 200. The transport is your choice:
+...}` responses that come back with HTTP 200. Responses are mapped as
+follows:
+
+| Response | Outcome |
+|---|---|
+| 2xx | success |
+| 401 (`unauthorizedStatusCodes`) | unauthorized: sync stops until the next sign-in |
+| `isAlreadyExists` returns true for a create | success: the existing record is adopted |
+| 409 | conflict |
+| 404 to a delete | success (already gone) |
+| 408, 425, 429, 5xx | retry, honoring `Retry-After` (seconds or HTTP date) |
+| anything else, including 3xx and 403 | rejected: the operation is kept as failed |
+
+403 usually means "not allowed for this record", so it fails that one
+operation instead of stopping all sync; use `unauthorizedStatusCodes: {401,
+403}` if your server answers 403 to an expired token. Error messages are
+read from `message`, RFC 7807 problem details (`title`, `detail`) and
+validation `errors`; override `errorMessage` to customize them.
+
+The transport is your choice:
 
 ```dart
 Future<RestResponse> transport(RestRequest r) async {
@@ -236,9 +281,10 @@ Future<RestResponse> transport(RestRequest r) async {
 ```
 
 Let transport exceptions (`SocketException`, `TimeoutException`,
-`ClientException`) propagate as-is. The engine treats them as "offline" and
-does not count them as an attempt. **Do not** turn them into fake HTTP
-responses.
+`ClientException`, dio connection errors) propagate as-is. The engine treats
+them as "offline" and does not count them as an attempt (see
+`isNetworkError`, which also works in release web builds). **Do not** turn
+them into fake HTTP responses.
 
 For any unusual API, implement `RemoteAdapter` directly and return a
 `PushOutcome`:
@@ -261,16 +307,58 @@ the outbox together.
 
 Implement `SqlExecutor` on top of your database — see its doc comment for a
 five-line `drift` example. For `sqflite`, route queries to the currently open
-transaction (`Database.transaction`'s callback) via a `Zone` so writes inside
-`SqlSyncStore.transaction` land in the same transaction as your own.
+transaction through a `Zone`, so writes inside `SqlSyncStore.transaction`
+land in the same transaction as your own:
+
+```dart
+class SqfliteExecutor implements SqlExecutor {
+  SqfliteExecutor(this.db);
+  final Database db;
+  final _txn = Object(); // per instance: never joins another database's
+
+  DatabaseExecutor get _current => Zone.current[_txn] as DatabaseExecutor? ?? db;
+
+  @override
+  Future<void> execute(String sql, [List<Object?> args = const []]) =>
+      _current.execute(sql, args);
+
+  @override
+  Future<List<Map<String, Object?>>> query(String sql,
+          [List<Object?> args = const []]) =>
+      _current.rawQuery(sql, args);
+
+  @override
+  Future<T> transaction<T>(Future<T> Function() action) {
+    if (Zone.current[_txn] != null) return action();
+    return db.transaction((txn) => runZoned(action, zoneValues: {_txn: txn}));
+  }
+}
+```
+
+Run your own writes through the same executor's `transaction` (or
+`sync.store.transaction`) so a row and its outbox entry commit together.
 
 ## Pulling
 
 | `PullMode` | When to use it |
 |---|---|
-| `incremental` | The API supports filtering by modification time. Pair it with `UpdatedSincePagination`; the cursor survives restarts. |
-| `fullRefresh` | The API only supports full listing. Pair it with `PagePagination`. `LocalAdapter.onFullRefreshComplete` receives every server id seen, so you can delete rows the server no longer has. |
+| `incremental` | The API supports filtering by modification time or returns a change cursor. Pair it with `UpdatedSincePagination` or `CursorPagination`; the cursor survives restarts. |
+| `fullRefresh` | The API only supports full listing. Pair it with `PagePagination` or `OffsetPagination`. `LocalAdapter.onFullRefreshComplete` receives every server id seen, so you can delete rows the server no longer has. It is only called when every page arrived. |
 | `none` | Push-only entities |
+
+| Pagination | Request | Next page |
+|---|---|---|
+| `PagePagination` | `?page=1&count=500` | a full page means there is more, or `hasMoreOf` |
+| `OffsetPagination` | `?offset=0&limit=500` | same as above |
+| `UpdatedSincePagination` | `?updatedSince=<newest seen>&count=500` | a full page means there is more |
+| `CursorPagination` | `?cursor=<from the response>&limit=500` | `nextCursor`/`next_cursor`/`nextPageToken` and `hasMore`/`has_more` in the body or in `meta`/`pagination`, or your own readers |
+
+If the server caps the page size below `pullPageSize`, lower `pullPageSize`
+or pass `hasMoreOf`, otherwise only the first page is pulled. Override
+`PullPagination.toPageFromResponse` to read any other paging metadata. A
+response in which no list of records can be found is reported as an error
+rather than read as an empty page; pass `extractRecords` for unusual
+formats.
 
 Parent entities are pulled first, in an order inferred from `references` and
 `dependsOn`. Registration order does not matter.
@@ -281,7 +369,7 @@ A conflict is a pulled record whose local copy still has unpushed changes, or
 a push that the server answered with `conflict`.
 
 - `ConflictStrategy.keepLocal` (default): the device's change wins and is
-  pushed.
+  pushed with `force`.
 - `ConflictStrategy.serverWins`: the server's copy is adopted and the local
   change is discarded.
 - `ConflictStrategy.lastWriteWins`: compares `updatedAtOf(record)` against the
@@ -305,8 +393,35 @@ SyncConfig(
 ```
 
 Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushEnabled`,
-`coalesce`, `mergePayload`, `serverIdOf`, `updatedAtOf`, `isDeletedOf` (for
-server-deleted records), and `unknownReferencePolicy`.
+`coalesce`, `mergePayload`, `serverIdOf`, `serverIdToJson`, `updatedAtOf`,
+`isDeletedOf` (for server-deleted records), and `unknownReferencePolicy`.
+
+`syncNow`, `pushNow` and `pullNow` accept `entities: {...}` to limit a run.
+`clear()` (for logout) and `resetPullCursor()` wait for a run in progress.
+
+## Testing
+
+`InMemorySyncStore` behaves like a single-connection database, and
+`ManualConnectivity` lets a test go offline and back. Turn the automatic
+triggers off to drive every run yourself:
+
+```dart
+final sync = SyncEngine(
+  store: InMemorySyncStore(),
+  connectivity: ManualConnectivity(),
+  config: const SyncConfig(
+    syncOnStart: false, syncOnResume: false, syncOnReconnect: false,
+    autoPushAfterWrite: false, periodicInterval: null,
+  ),
+  entities: [/* CallbackRemoteAdapter / CallbackLocalAdapter */],
+);
+await sync.recordCreate('notes', 'a', {'text': 'hi'});
+final result = await sync.syncNow();
+expect(result.pushed, 1);
+```
+
+To test against real SQLite, use `SqlSyncStore` with the executor above and
+`sqflite_common_ffi`.
 
 ## Migrating an existing app
 
