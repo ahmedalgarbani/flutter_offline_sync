@@ -135,7 +135,9 @@ class _NotesPageState extends State<NotesPage> {
           IconButton(
             tooltip: 'Sync now',
             icon: const Icon(Icons.sync),
-            onPressed: _sync.syncNow,
+            // A sync the user asked for also retries changes that are
+            // waiting out a backoff delay.
+            onPressed: () => _sync.syncNow(ignoreBackoff: true),
           ),
         ],
       ),

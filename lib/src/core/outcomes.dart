@@ -45,7 +45,8 @@ sealed class PushOutcome {
   }) = PushSuccess;
 
   /// Temporary server-side failure (5xx, 429, timeout). Counts as an attempt
-  /// and is retried with backoff.
+  /// and is retried with backoff: after the retry policy's delay, or after
+  /// [retryAfter] (the server's `Retry-After`) when that is longer.
   const factory PushOutcome.retry(Object error, {Duration? retryAfter}) =
       PushRetry;
 
@@ -180,8 +181,9 @@ PushOutcome defaultClassifyError(Object error) {
 /// True when [error] means the server could not be reached:
 /// [SyncNetworkException], [TimeoutException], `dart:io`'s
 /// `SocketException`, `HttpException` and `HandshakeException`,
-/// `package:http`'s `ClientException`, WebSocket errors, and dio's
-/// connection and timeout errors.
+/// `package:http`'s `ClientException`, WebSocket errors, dio's connection
+/// and timeout errors (dio 4 and 5, including socket errors dio wraps as
+/// "unknown"), and GraphQL link `NetworkException`s.
 ///
 /// Errors are matched by name, so the package needs neither `dart:io` nor an
 /// HTTP client. The message is checked as well as the type: release web
@@ -194,7 +196,9 @@ bool isNetworkError(Object error) {
   if (_networkErrorTypes.contains(error.runtimeType.toString())) return true;
   final message = error.toString();
   return _networkErrorMessage.hasMatch(message) ||
-      _dioNetworkErrors.any(message.startsWith);
+      _dioNetworkErrors.any(message.startsWith) ||
+      _dio4NetworkError.hasMatch(message) ||
+      _dioWrappedNetworkError.hasMatch(message);
 }
 
 const _networkErrorTypes = {
@@ -204,11 +208,12 @@ const _networkErrorTypes = {
   'HttpException',
   'WebSocketException',
   'WebSocketChannelException',
+  'NetworkException',
 };
 
 final _networkErrorMessage = RegExp(r'^(SocketException|ClientException|'
     r'HandshakeException|HttpException|WebSocketException|'
-    r'WebSocketChannelException)\b');
+    r'WebSocketChannelException|NetworkException)\b');
 
 const _dioNetworkErrors = [
   'DioException [connection timeout]',
@@ -216,3 +221,15 @@ const _dioNetworkErrors = [
   'DioException [send timeout]',
   'DioException [receive timeout]',
 ];
+
+/// dio 4 and early dio 5 (`DioError [DioErrorType.connectTimeout]: ...`).
+final _dio4NetworkError = RegExp(r'^DioError \[DioErrorType\.'
+    r'(connectTimeout|connectionTimeout|sendTimeout|receiveTimeout|'
+    r'connectionError)\]');
+
+/// A transport failure dio reports as "unknown"/"other", e.g.
+/// `DioException [unknown]: null\nError: SocketException: ...`.
+final _dioWrappedNetworkError =
+    RegExp(r'^Dio(Exception|Error) \[(unknown|DioErrorType\.(other|unknown))\]'
+        r'[\s\S]*\b(SocketException|HandshakeException|HttpException|'
+        r'ClientException)\b');

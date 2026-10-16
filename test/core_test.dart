@@ -265,6 +265,15 @@ void main() {
         _Opaque('HandshakeException: Handshake error in client'),
         _Opaque('DioException [connection error]: The connection errored'),
         _Opaque('DioException [receive timeout]: took longer than 30s'),
+        // dio reports some socket failures as "unknown".
+        _Opaque('DioException [unknown]: null\n'
+            'Error: SocketException: Failed host lookup: api.example.com'),
+        // dio 4.
+        _Opaque('DioError [DioErrorType.connectTimeout]: Connecting timed out'),
+        _Opaque('DioError [DioErrorType.other]: SocketException: '
+            'Connection refused'),
+        // graphql / gql_link.
+        _Opaque('NetworkException(originalException: Failed host lookup)'),
       ]) {
         expect(isNetworkError(error), isTrue, reason: '$error');
         expect(defaultClassifyError(error), isA<PushNetworkError>(),
@@ -277,6 +286,9 @@ void main() {
         StateError('bug'),
         const FormatException('bad json'),
         _Opaque('DioException [bad response]: 500'),
+        // A certificate problem is not solved by waiting for a connection.
+        _Opaque('DioException [bad certificate]: HandshakeException'),
+        _Opaque('DioError [DioErrorType.response]: Http status error [500]'),
         _Opaque('MyClientExceptionHandler failed'),
       ]) {
         expect(isNetworkError(error), isFalse, reason: '$error');

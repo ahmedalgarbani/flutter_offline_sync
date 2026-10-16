@@ -18,6 +18,7 @@ class SyncConfig {
   const SyncConfig({
     this.retryPolicy = const RetryPolicy(),
     this.debounce = const Duration(milliseconds: 800),
+    this.maxDebounce = const Duration(seconds: 5),
     this.periodicInterval = const Duration(minutes: 5),
     this.syncOnStart = true,
     this.syncOnResume = true,
@@ -26,6 +27,7 @@ class SyncConfig {
     this.pullOnSync = true,
     this.maxPushPasses = 10,
     this.canSync,
+    this.onUnauthorized,
     this.classifyError = defaultClassifyError,
     this.onOperationFailed,
     this.logger,
@@ -36,6 +38,13 @@ class SyncConfig {
 
   /// Delay that groups bursts of writes into one push.
   final Duration debounce;
+
+  /// Longest an automatic sync can be put off by writes that keep arriving
+  /// less than [debounce] apart (a form saving on every keystroke, a
+  /// tracker logging every second). Once this much time has passed since
+  /// the first postponed request, the sync starts anyway. Null lets writes
+  /// postpone it indefinitely.
+  final Duration? maxDebounce;
 
   /// Background full sync interval. Null disables it.
   final Duration? periodicInterval;
@@ -61,6 +70,16 @@ class SyncConfig {
   /// Gate checked before each run, e.g. "user is logged in and the session
   /// is valid". Returning false pauses sync without touching the outbox.
   final FutureOr<bool> Function()? canSync;
+
+  /// Called when the server reports expired credentials during a run (a
+  /// push or pull answered `unauthorized`), at most once per run. Refresh
+  /// the session and return true to retry at once; return false (or throw)
+  /// to stop with `SyncPhase.authRequired` until the next sync request.
+  ///
+  /// ```dart
+  /// onUnauthorized: () => auth.refreshToken(), // Future<bool>
+  /// ```
+  final FutureOr<bool> Function()? onUnauthorized;
 
   /// Maps an error thrown by an adapter to an outcome.
   final PushOutcome Function(Object error) classifyError;

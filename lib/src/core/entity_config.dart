@@ -45,6 +45,7 @@ class SyncEntityConfig {
     this.dependsOn = const [],
     this.serverIdOf = _defaultServerIdOf,
     this.serverIdToJson,
+    this.clientIdOf,
     this.updatedAtOf,
     this.isDeletedOf,
     this.pullMode = PullMode.incremental,
@@ -83,6 +84,21 @@ class SyncEntityConfig {
   /// Set `serverIdToJson: int.parse` when local ids are strings (such as the
   /// UUIDs from `SyncEngine.newLocalId`) but the server expects numbers.
   final Object Function(String serverId)? serverIdToJson;
+
+  /// Reads, from a pulled server record, the local id this device gave it,
+  /// for servers that store a client-generated id (send it in the payload,
+  /// e.g. `recordCreate('notes', id, {'clientId': id, ...})`).
+  ///
+  /// It lets the engine recognize its own records in a pull. Without it, a
+  /// create that reached the server but whose response was lost (a timeout
+  /// or a 502 after the server saved it) is pulled back as a new record and
+  /// stored twice on the device. With it, the pulled record is linked to the
+  /// local one and the queued create is sent as an update instead.
+  ///
+  /// ```dart
+  /// clientIdOf: (record) => record['clientId'],
+  /// ```
+  final Object? Function(Map<String, dynamic> record)? clientIdOf;
 
   /// Reads the server's last-modified time (used by last-write-wins).
   final DateTime? Function(Map<String, dynamic> record)? updatedAtOf;

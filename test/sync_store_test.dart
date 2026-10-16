@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_offline_first_sync/flutter_offline_first_sync.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -199,6 +200,13 @@ void storeContract(String name, Future<SyncStore> Function() open) {
       expect(await store.getMeta('k'), 'v');
     });
 
+    test('rejects payloads a database cannot store', () async {
+      await expectLater(
+          store.insertOperation(_op('1', payload: {'at': DateTime(2024)})),
+          throwsA(isA<JsonUnsupportedObjectError>()));
+      expect(await store.operations(), isEmpty);
+    });
+
     test('clear removes operations, mappings and meta', () async {
       await store.insertOperation(_op('1'));
       await store.putMapping('notes', 'a', '1');
@@ -211,8 +219,40 @@ void storeContract(String name, Future<SyncStore> Function() open) {
   });
 }
 
+/// A [KeyValueStorage] in a map that can be told to fail.
+class _MapStorage extends KeyValueStorage {
+  final Map<String, String> values = {};
+  int writes = 0;
+  bool failWrites = false;
+
+  @override
+  Future<String?> read(String key) async => values[key];
+
+  @override
+  Future<void> write(String key, String? value) async {
+    if (failWrites) throw StateError('disk full');
+    writes++;
+    if (value == null) {
+      values.remove(key);
+    } else {
+      values[key] = value;
+    }
+  }
+}
+
+/// The sqflite setup from the [CallbackSqlExecutor] docs.
+CallbackSqlExecutor<DatabaseExecutor> _callbackExecutor(Database db) =>
+    CallbackSqlExecutor<DatabaseExecutor>(
+      connection: db,
+      execute: (c, sql, args) => c.execute(sql, args),
+      query: (c, sql, args) => c.rawQuery(sql, args),
+      transaction: (action) => db.transaction(action),
+    );
+
 void main() {
   storeContract('InMemorySyncStore', () async => InMemorySyncStore());
+  storeContract(
+      'KeyValueSyncStore', () async => KeyValueSyncStore(_MapStorage()));
 
   final databases = <Database>[];
   tearDownAll(() async {
@@ -224,6 +264,11 @@ void main() {
     final db = await openTestDatabase();
     databases.add(db);
     return SqlSyncStore(SqfliteExecutor(db));
+  });
+  storeContract('SqlSyncStore (CallbackSqlExecutor)', () async {
+    final db = await openTestDatabase();
+    databases.add(db);
+    return SqlSyncStore(_callbackExecutor(db));
   });
 
   group('InMemorySyncStore', () {
@@ -276,9 +321,182 @@ void main() {
         {'qty': 1},
       ]);
     });
+
+    test('hands out copies, so callers cannot change what is stored', () async {
+      final store = InMemorySyncStore();
+      final inserted = await store.insertOperation(_op('1'));
+      inserted.payload['text'] = 'changed';
+      (await store.operationById('1'))!.payload['text'] = 'changed';
+      (await store.operations()).single.payload['text'] = 'changed';
+      (await store.operationsFor('notes', 'a')).single.payload['text'] =
+          'changed';
+      expect((await store.operationById('1'))!.payload['text'], 'x');
+    });
+  });
+
+  group('KeyValueSyncStore', () {
+    test('survives a restart', () async {
+      final storage = _MapStorage();
+      final before = KeyValueSyncStore(storage);
+      await before.init();
+      await before.insertOperation(_op('1', payload: {
+        'text': 'héllo',
+        'items': [
+          {'qty': 2},
+        ],
+      }));
+      await before.insertOperation(_op('2', status: SyncOpStatus.failed));
+      await before.putMapping('notes', 'a', '100');
+      await before.putMapping('notes', 'b', null);
+      await before.setMeta('cursor:notes', '42');
+
+      final after = KeyValueSyncStore(storage);
+      await after.init();
+      final ops = await after.operations();
+      expect(ops.map((o) => o.id), ['1', '2']);
+      expect(ops.first.payload, {
+        'text': 'héllo',
+        'items': [
+          {'qty': 2},
+        ],
+      });
+      expect(ops.last.status, SyncOpStatus.failed);
+      expect((await after.mappingForLocal('notes', 'a'))!.serverId, '100');
+      expect((await after.mappingForLocal('notes', 'b'))!.isLocalOnly, isTrue);
+      expect(await after.getMeta('cursor:notes'), '42');
+      // Sequence numbers continue where they stopped.
+      final next = await after.insertOperation(_op('3'));
+      expect(next.seq, greaterThan(ops.last.seq!));
+    });
+
+    test('saves a transaction once, when it commits', () async {
+      final storage = _MapStorage();
+      final store = KeyValueSyncStore(storage);
+      await store.init();
+      await store.transaction(() async {
+        await store.insertOperation(_op('1'));
+        await store.putMapping('notes', 'a', null);
+        await store.setMeta('k', 'v');
+      });
+      expect(storage.writes, 1);
+
+      await expectLater(store.transaction<void>(() async {
+        await store.setMeta('k', 'rolled back');
+        throw StateError('boom');
+      }), throwsStateError);
+      expect(storage.writes, 1);
+      expect(await store.getMeta('k'), 'v');
+    });
+
+    test('a change that cannot be saved is rolled back', () async {
+      final storage = _MapStorage();
+      final store = KeyValueSyncStore(storage);
+      await store.init();
+      await store.insertOperation(_op('1'));
+      storage.failWrites = true;
+      await expectLater(store.insertOperation(_op('2')), throwsStateError);
+      await expectLater(store.deleteOperation('1'), throwsStateError);
+      storage.failWrites = false;
+      expect((await store.operations()).map((o) => o.id), ['1']);
+    });
+
+    test('unreadable saved state is reported and left untouched', () async {
+      final storage = _MapStorage()..values['flutter_offline_first_sync'] = '{';
+      final store = KeyValueSyncStore(storage);
+      await expectLater(store.init(), throwsFormatException);
+      expect(storage.values['flutter_offline_first_sync'], '{');
+    });
+
+    test('refuses changes before init, which would lose the saved state',
+        () async {
+      final storage = _MapStorage();
+      final saved = KeyValueSyncStore(storage);
+      await saved.init();
+      await saved.setMeta('k', 'v');
+
+      final store = KeyValueSyncStore(storage);
+      await expectLater(store.setMeta('other', 'x'), throwsStateError);
+      await store.init();
+      expect(await store.getMeta('k'), 'v');
+    });
+
+    test('keeps separate outboxes under separate keys', () async {
+      final storage = _MapStorage();
+      final ann = KeyValueSyncStore(storage, key: 'sync:ann');
+      final bob = KeyValueSyncStore(storage, key: 'sync:bob');
+      await ann.init();
+      await bob.init();
+      await ann.setMeta('k', 'ann');
+      await bob.setMeta('k', 'bob');
+      final annAgain = KeyValueSyncStore(storage, key: 'sync:ann');
+      await annAgain.init();
+      expect(await annAgain.getMeta('k'), 'ann');
+    });
+
+    test('an engine picks up the outbox after a restart', () async {
+      final storage = _MapStorage();
+      final server = FakeServer();
+      final db = FakeLocalDb();
+      SyncEngine open() => SyncEngine(
+            store: KeyValueSyncStore(storage),
+            config: manualConfig,
+            entities: [entity('notes', server, db)],
+          );
+
+      final first = open();
+      await first.recordCreate('notes', 'a', {'text': 'offline'});
+      await first.dispose();
+
+      final second = open();
+      addTearDown(second.dispose);
+      final result = await second.syncNow();
+      expect(result.pushed, 1);
+      expect(server.pushes.single.payload, {'text': 'offline'});
+      expect(await second.serverIdOf('notes', 'a'), isNotNull);
+    });
   });
 
   group('SqlSyncStore', () {
+    test('rejects a table prefix that is not an identifier', () async {
+      final db = await openTestDatabase();
+      addTearDown(db.close);
+      for (final prefix in ['my-app_', 'x y', '1sync_', 'a;DROP']) {
+        expect(() => SqlSyncStore(SqfliteExecutor(db), tablePrefix: prefix),
+            throwsArgumentError,
+            reason: prefix);
+      }
+      for (final prefix in ['', 'app_sync_', '_s1']) {
+        expect(SqlSyncStore(SqfliteExecutor(db), tablePrefix: prefix),
+            isA<SqlSyncStore>());
+      }
+    });
+
+    test('CallbackSqlExecutor commits the app\'s rows and the outbox together',
+        () async {
+      final db = await openTestDatabase();
+      addTearDown(db.close);
+      final executor = _callbackExecutor(db);
+      final store = SqlSyncStore(executor);
+      await store.init();
+      await db.execute('CREATE TABLE notes (id TEXT PRIMARY KEY, text TEXT)');
+
+      Future<void> write(String id, {bool fail = false}) =>
+          executor.transaction(() async {
+            await executor.current.insert('notes', {'id': id, 'text': 'x'});
+            // Joins the open transaction instead of waiting for it.
+            await store
+                .transaction(() => store.insertOperation(_op(id, localId: id)));
+            if (fail) throw StateError('boom');
+          });
+
+      await write('kept');
+      await expectLater(write('dropped', fail: true), throwsStateError);
+      final rows = await db.query('notes');
+      expect(rows.map((r) => r['id']), ['kept']);
+      expect((await store.operations()).map((o) => o.id), ['kept']);
+      expect(executor.current, same(db)); // outside a transaction
+    });
+
     test('uses the table prefix', () async {
       final db = await openTestDatabase();
       addTearDown(db.close);

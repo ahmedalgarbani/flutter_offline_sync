@@ -399,6 +399,34 @@ void main() {
       expect(page.hasMore, isFalse);
     });
 
+    test('UpdatedSincePagination reads numeric timestamps and versions', () {
+      final pagination = UpdatedSincePagination(
+          updatedAtOf: (r) => r['updatedAt']?.toString());
+      // Epoch milliseconds: 13 digits, which are not a date.
+      var page = pagination.toPage([
+        {'updatedAt': 1700000005000},
+        {'updatedAt': 1700000000000},
+      ], null, 10);
+      expect(page.nextCursor, '1700000005000');
+      page = pagination.toPage([
+        {'updatedAt': 1700000009000},
+      ], page.nextCursor, 10);
+      expect(page.nextCursor, '1700000009000');
+
+      // Row versions compare as numbers, not as text ('9' > '10').
+      page = pagination.toPage([
+        {'updatedAt': 10},
+        {'updatedAt': 9},
+      ], '8', 10);
+      expect(page.nextCursor, '10');
+
+      // Dates with different offsets compare as instants.
+      page = pagination.toPage([
+        {'updatedAt': '2024-01-01T12:30:00+02:00'}, // 10:30Z
+      ], '2024-01-01T11:00:00Z', 10);
+      expect(page.nextCursor, '2024-01-01T11:00:00Z');
+    });
+
     test('CursorPagination reads the next cursor from the response', () {
       const pagination = CursorPagination();
       expect(pagination.query(null, 5), {'limit': '5'});

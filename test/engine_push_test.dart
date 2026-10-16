@@ -103,6 +103,49 @@ void main() {
       expect(server.table('notes').values.single['text'], 'v2');
     });
 
+    test('deleting a record whose create was discarded sends nothing',
+        () async {
+      final sync = engine([entity('notes', server, db)]);
+      server.onPush = (_) => const PushOutcome.rejected('invalid');
+      await sync.recordCreate('notes', 'a', {'text': 'x'});
+      await sync.syncNow();
+      await sync.discard((await sync.failedOperations()).single.id);
+      server.onPush = null;
+
+      expect(await sync.recordDelete('notes', 'a'), isNull);
+      final result = await sync.syncNow();
+      expect(result.failed, 0);
+      expect(await sync.pendingOperations(), isEmpty);
+      expect(await sync.failedOperations(), isEmpty);
+      expect(server.pushes, hasLength(1)); // only the rejected create
+    });
+
+    test('a record another push creates still queues its delete', () async {
+      final sync = engine(
+          [entity('accounts', server, db), entity('customers', server, db)]);
+      await sync.recordCreate('accounts', 'acc', {});
+      await sync.recordCreatedVia('customers', 'c',
+          viaEntity: 'accounts', viaLocalId: 'acc');
+      expect(await sync.recordDelete('customers', 'c'), isNotNull);
+    });
+
+    test('registerMappings links many existing rows at once', () async {
+      final sync = engine([entity('notes', server, db)]);
+      await sync.registerMappings('notes', {1: 501, 2: '502'});
+      expect(await sync.serverIdOf('notes', 1), '501');
+      expect(await sync.localIdOf('notes', 502), '2');
+
+      server.table('notes')['502'] = {'id': 502};
+      await sync.recordUpdate('notes', 2, {'text': 'x'});
+      await sync.syncNow();
+      expect(server.pushes.single.type, SyncOpType.update);
+      expect(server.pushes.single.serverId, '502');
+
+      await expectLater(
+          sync.registerMappings('notes', {3: ''}), throwsArgumentError);
+      expect(await sync.serverIdOf('notes', 3), isNull);
+    });
+
     test('rejects invalid writes', () async {
       final sync = engine([
         entity('notes', server, db),
@@ -455,6 +498,9 @@ void main() {
             syncOnResume: false,
             periodicInterval: null,
             debounce: Duration(milliseconds: 10),
+            // Shorter than Retry-After, which therefore sets the delay.
+            retryPolicy:
+                RetryPolicy(baseDelay: Duration(milliseconds: 10), jitter: 0),
           ));
       var calls = 0;
       server.onPush = (_) => ++calls == 1
@@ -564,6 +610,121 @@ void main() {
       signedIn = true;
       await sync.syncNow();
       expect(sync.status.value.phase, SyncPhase.idle);
+      expect(sync.status.value.isUpToDate, isTrue);
+    });
+
+    test('onUnauthorized refreshes the session once per run', () async {
+      var token = 'old';
+      var refreshes = 0;
+      final sync = engine([entity('notes', server, db)],
+          config: SyncConfig(
+            syncOnStart: false,
+            syncOnResume: false,
+            autoPushAfterWrite: false,
+            periodicInterval: null,
+            onUnauthorized: () async {
+              refreshes++;
+              token = 'new';
+              return true;
+            },
+          ));
+      server.onPush = (_) =>
+          token == 'old' ? const PushOutcome.unauthorized('expired') : null;
+      await sync.recordCreate('notes', 'a', {});
+      await sync.recordCreate('notes', 'b', {});
+      final result = await sync.syncNow();
+
+      expect(result.completed, isTrue);
+      expect(result.pushed, 2);
+      expect(refreshes, 1);
+      expect(sync.status.value.phase, SyncPhase.idle);
+      expect((await sync.serverIdOf('notes', 'a')), isNotNull);
+    });
+
+    test('a refresh that does not help stops the run', () async {
+      var refreshes = 0;
+      final sync = engine([entity('notes', server, db)],
+          config: SyncConfig(
+            syncOnStart: false,
+            syncOnResume: false,
+            autoPushAfterWrite: false,
+            periodicInterval: null,
+            onUnauthorized: () {
+              refreshes++;
+              return true;
+            },
+          ));
+      server.onPush = (_) => const PushOutcome.unauthorized('expired');
+      await sync.recordCreate('notes', 'a', {});
+      final result = await sync.syncNow();
+
+      expect(result.abortedBy, SyncAbortReason.unauthorized);
+      expect(refreshes, 1);
+      expect(server.pushes, hasLength(2));
+      expect(sync.status.value.phase, SyncPhase.authRequired);
+      expect((await sync.pendingOperations()).single.attempts, 0);
+    });
+
+    test('Retry-After can lengthen the backoff but never shorten it', () async {
+      var now = DateTime(2024, 1, 1, 12);
+      final sync = engine([entity('notes', server, db)],
+          config: SyncConfig(
+            syncOnStart: false,
+            syncOnResume: false,
+            autoPushAfterWrite: false,
+            periodicInterval: null,
+            clock: () => now,
+            retryPolicy:
+                const RetryPolicy(baseDelay: Duration(seconds: 10), jitter: 0),
+          ));
+      var calls = 0;
+      // Zero, as a server (or a Retry-After date read with a skewed clock)
+      // may say.
+      server.onPush = (request) {
+        if (request.localId != 'a') return null;
+        calls++;
+        return const PushOutcome.retry('slow down', retryAfter: Duration.zero);
+      };
+      await sync.recordCreate('notes', 'a', {});
+      for (var i = 0; i < 5; i++) {
+        await sync.recordCreate('notes', 'b$i', {});
+      }
+      await sync.syncNow();
+      expect(calls, 1); // not resent in the same run
+      expect(sync.status.value.nextRetryAt, DateTime(2024, 1, 1, 12, 0, 10));
+
+      now = now.add(const Duration(seconds: 10));
+      server.onPush = (_) =>
+          const PushOutcome.retry('later', retryAfter: Duration(minutes: 5));
+      await sync.syncNow();
+      expect(
+          sync.status.value.nextRetryAt, now.add(const Duration(minutes: 5)));
+    });
+
+    test('syncNow(ignoreBackoff: true) retries backed-off operations now',
+        () async {
+      final now = DateTime(2024, 1, 1, 12);
+      final sync = engine([entity('notes', server, db)],
+          config: SyncConfig(
+            syncOnStart: false,
+            syncOnResume: false,
+            autoPushAfterWrite: false,
+            periodicInterval: null,
+            clock: () => now,
+            retryPolicy:
+                const RetryPolicy(baseDelay: Duration(minutes: 1), jitter: 0),
+          ));
+      var down = true;
+      server.onPush = (_) => down ? const PushOutcome.retry('down') : null;
+      await sync.recordCreate('notes', 'a', {});
+      await sync.syncNow();
+      down = false;
+
+      await sync.syncNow();
+      expect(server.pushes, hasLength(1)); // still backing off
+      final result = await sync.syncNow(ignoreBackoff: true);
+      expect(result.pushed, 1);
+      expect(server.pushes, hasLength(2));
       expect(sync.status.value.isUpToDate, isTrue);
     });
 
@@ -712,6 +873,36 @@ void main() {
       expect(
           server.pushes.last.payload, {'id': 100, 'text': 'local', 'tag': 's'});
       expect(db.table('notes')['a']!['text'], 'local');
+    });
+
+    test('a merge also covers updates queued behind the conflict', () async {
+      final sync = engine([
+        entity('notes', server, db,
+            conflictResolver: (c) => ConflictResolution.merge(
+                {...c.localPayload, 'phone': c.serverRecord!['phone']})),
+      ]);
+      server.table('notes')['100'] = {'id': 100, 'name': 's', 'phone': 'S'};
+      await sync.registerMapping('notes', 'a', '100');
+      final gate = Completer<void>();
+      var conflicts = 0;
+      server.onPush = (r) async {
+        if (r.force || conflicts++ > 0) return null;
+        await gate.future;
+        return const PushOutcome.conflict(
+            serverRecord: {'id': 100, 'name': 's', 'phone': 'S'});
+      };
+      await sync.recordUpdate('notes', 'a', {'name': 'L'});
+      final run = sync.syncNow();
+      await settle(const Duration(milliseconds: 10));
+      // Recorded while the first update is in flight: its own operation.
+      await sync.recordUpdate('notes', 'a', {'phone': 'L'});
+      gate.complete();
+      await run;
+      await sync.syncNow();
+
+      expect(
+          server.table('notes')['100'], {'id': 100, 'name': 'L', 'phone': 'S'});
+      expect(await sync.pendingOperations(), isEmpty);
     });
 
     test('a throwing resolver backs off instead of sticking', () async {

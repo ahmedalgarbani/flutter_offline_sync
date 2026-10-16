@@ -180,6 +180,24 @@ void main() {
       expect(remote.pulls, 0); // writes only push
     });
 
+    test('a steady stream of writes cannot postpone sync forever', () async {
+      final sync = engine(
+          config: const SyncConfig(
+        syncOnStart: false,
+        syncOnResume: false,
+        periodicInterval: null,
+        debounce: Duration(milliseconds: 50),
+        maxDebounce: Duration(milliseconds: 150),
+      ));
+      await sync.start();
+      // Half a second of writes, each sooner than the debounce delay.
+      for (var i = 0; i < 25; i++) {
+        await sync.recordCreate('notes', 'n$i', {});
+        await settle(const Duration(milliseconds: 20));
+      }
+      expect(remote.pushes, greaterThan(0));
+    });
+
     test('a write made during a run is pushed right after it', () async {
       final sync = engine(config: auto);
       await sync.start();
@@ -427,6 +445,30 @@ void main() {
   });
 
   group('status', () {
+    test('watchStatus streams the status and closes on dispose', () async {
+      final sync = engine();
+      final seen = <SyncStatus>[];
+      final done = Completer<void>();
+      sync.watchStatus().listen(seen.add, onDone: done.complete);
+      final cancelled = sync.watchStatus().listen((_) {});
+      await settle();
+      expect(seen.single.pendingCount, 0);
+      await cancelled.cancel();
+
+      await sync.recordCreate('notes', 'a', {});
+      await settle();
+      expect(seen.last.pendingCount, 1);
+      await sync.syncNow();
+      await settle();
+      expect(seen.last.isUpToDate, isTrue);
+      expect(seen.last.lastSyncedAt, isNotNull);
+
+      await sync.dispose();
+      await done.future;
+      // Watching a disposed engine gives its last status and ends.
+      expect(await sync.watchStatus().toList(), hasLength(1));
+    });
+
     test('an unchanged status does not notify listeners', () async {
       final sync = engine();
       await sync.recordCreate('notes', 'a', {'v': 1});

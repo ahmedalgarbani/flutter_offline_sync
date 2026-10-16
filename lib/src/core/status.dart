@@ -181,7 +181,8 @@ enum SyncEventType {
   /// A failed change was queued again by `retryFailed`.
   operationRetried,
 
-  /// A change was removed by `discard`.
+  /// A change was removed without being sent: by `discard`, or because the
+  /// server deleted the record ([SyncEvent.message] says so).
   operationDiscarded,
 
   /// A server record was written locally.

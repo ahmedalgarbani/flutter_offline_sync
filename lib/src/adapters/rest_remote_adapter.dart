@@ -186,6 +186,9 @@ class OffsetPagination extends PullPagination {
 /// with `>=`, so records sharing the boundary timestamp are not skipped.
 /// When more than a page of records can share one timestamp, prefer
 /// [CursorPagination] with a server-side cursor.
+///
+/// Timestamps may be ISO 8601 dates or numbers (epoch seconds or
+/// milliseconds, a row version); see [compareCursors].
 class UpdatedSincePagination extends PullPagination {
   const UpdatedSincePagination({
     required this.updatedAtOf,
@@ -207,20 +210,31 @@ class UpdatedSincePagination extends PullPagination {
   PullPage toPage(
       List<Map<String, dynamic>> records, String? cursor, int limit) {
     String? newest = cursor;
-    DateTime? newestTime = cursor == null ? null : DateTime.tryParse(cursor);
     for (final record in records) {
-      final raw = updatedAtOf(record);
-      final time = raw == null ? null : DateTime.tryParse(raw);
-      if (time != null && (newestTime == null || time.isAfter(newestTime))) {
-        newestTime = time;
-        newest = raw;
-      }
+      final raw = updatedAtOf(record)?.trim();
+      if (raw == null || raw.isEmpty) continue;
+      if (newest == null || compareCursors(raw, newest) > 0) newest = raw;
     }
     return PullPage(
       records: records,
       hasMore: records.length >= limit,
       nextCursor: newest,
     );
+  }
+
+  /// Orders two timestamps: as numbers when both are numeric (epoch times,
+  /// row versions), as dates when both are ISO 8601 dates, otherwise as
+  /// text.
+  static int compareCursors(String a, String b) {
+    final numA = num.tryParse(a);
+    final numB = num.tryParse(b);
+    if (numA != null && numB != null) return numA.compareTo(numB);
+    // A bare number is not a date here, though DateTime.tryParse may read
+    // some digit strings as one.
+    final dateA = numA == null ? DateTime.tryParse(a) : null;
+    final dateB = numB == null ? DateTime.tryParse(b) : null;
+    if (dateA != null && dateB != null) return dateA.compareTo(dateB);
+    return a.compareTo(b);
   }
 }
 

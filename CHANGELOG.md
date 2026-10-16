@@ -1,3 +1,84 @@
+## 0.3.0
+
+Integration release: the engine now plugs into more of the storage, network
+and state-management choices apps already make, and a review backed by
+reproduction tests found and fixed eleven bugs. No API was removed or
+renamed; read **Behavior changes** before upgrading.
+
+### Behavior changes
+
+- A `Retry-After` shorter than the retry policy's backoff no longer shortens
+  it; a longer one is still honored. A `Retry-After` of zero, or an HTTP date
+  in the past (a device clock ahead of the server's), used to resend the
+  operation at once, within the same run, until every attempt was used up.
+- `InMemorySyncStore` stores payloads as JSON, like `SqlSyncStore`: a payload
+  holding a value JSON cannot represent (a `DateTime`, say) now fails when it
+  is recorded, in tests as it already did in production.
+- `recordDelete` of a record that never got a server id and whose create was
+  discarded now sends nothing and returns null. It used to queue a delete
+  that always failed.
+- When the server deletes a record that has unpushed changes, an
+  `operationDiscarded` event is sent for each dropped change.
+- Writes can no longer postpone an automatic sync for more than
+  `SyncConfig.maxDebounce` (5 seconds by default).
+- `SyncRunResult.pulled` counts only records written locally, not those a
+  local change won a conflict over.
+- `SqlSyncStore` throws an `ArgumentError` for a `tablePrefix` holding
+  anything but letters, digits and underscores.
+
+### Fixes
+
+- Writes arriving less than `debounce` apart (an autosaving form, a location
+  tracker) postponed every automatic sync forever, including the periodic,
+  reconnect and resume ones.
+- `UpdatedSincePagination` ignored numeric timestamps (epoch seconds or
+  milliseconds, row versions): the cursor was never saved, so every pull
+  downloaded everything again. Numbers now compare as numbers, ISO dates as
+  instants.
+- A create that reached the server but whose response was lost (a timeout,
+  a 502 after the save) was pulled back as a new record and stored twice on
+  the device. Set the new `SyncEntityConfig.clientIdOf` when your server
+  stores the client id.
+- A push conflict resolved with `ConflictResolution.merge` was undone by an
+  update of the same record queued behind it. Those updates are part of the
+  conflict's `localPayload`, and are now folded into the merge.
+- Deleting a record whose failed create had been discarded left a failed
+  delete in the outbox (reproducible in the example app).
+- `isNetworkError` missed dio 4 errors, socket errors dio 5 reports as
+  `[unknown]`, and GraphQL `NetworkException`s, so time offline counted as
+  failed attempts and could fail operations.
+- `InMemorySyncStore` returned its own payload maps: changing an operation
+  read from it changed the outbox.
+- Server deletes dropped unpushed local changes without any event.
+- An invalid `tablePrefix` produced broken SQL at runtime.
+
+### Features
+
+- `KeyValueSyncStore`, `KeyValueStorage` and `CallbackKeyValueStorage`: a
+  durable outbox for apps on Hive, SharedPreferences, Isar, ObjectBox,
+  GetStorage or any key/value store.
+- `CallbackSqlExecutor`: an `SqlExecutor` from three functions for sqflite,
+  SQLCipher, sqlite3, drift or floor, routing statements to the open
+  transaction so your rows and the outbox commit together.
+- `SyncEngine.watchStatus()`: the status as a stream, for Provider,
+  Riverpod, Bloc, GetX or MobX.
+- `SyncConfig.onUnauthorized`: refresh an expired session once per run and
+  carry on.
+- `syncNow(ignoreBackoff: true)` and `pushNow(ignoreBackoff: true)` for a
+  "Sync now" button: operations waiting out a backoff are retried at once.
+- `SyncConfig.maxDebounce`.
+- `SyncEntityConfig.clientIdOf`.
+- `SyncEngine.registerMappings` registers many existing rows in one
+  transaction when migrating an app.
+- `UpdatedSincePagination.compareCursors`.
+
+### Other
+
+- README: a "Works with your stack" section with storage, network, session,
+  connectivity, state-management and background-sync recipes.
+- 202 package tests (from 151), including the shared store contract run
+  against `KeyValueSyncStore` and `CallbackSqlExecutor` on real SQLite.
+
 ## 0.2.0
 
 Reliability release: many fixes found by a new test suite, plus a few
