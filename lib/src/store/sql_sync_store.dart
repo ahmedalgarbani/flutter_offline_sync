@@ -5,7 +5,8 @@ import 'sync_store.dart';
 
 /// Minimal SQL access used by [SqlSyncStore]. Implement it on top of the
 /// database your app already has (drift, sqflite, sqlite3, ...) so the
-/// outbox lives next to your data.
+/// outbox lives next to your data, or build one from three functions with
+/// [CallbackSqlExecutor].
 ///
 /// drift:
 /// ```dart
@@ -39,12 +40,138 @@ abstract class SqlExecutor {
   Future<T> transaction<T>(Future<T> Function() action);
 }
 
+/// A [SqlExecutor] built from three functions, for any SQLite API: sqflite,
+/// sqlcipher, sqlite3, drift, floor, ...
+///
+/// [C] is the API's connection type. Inside [transaction], statements are
+/// sent to the transaction's connection (routed through a zone), so the
+/// outbox and your own writes commit or roll back together. Use [current]
+/// for your own statements there:
+///
+/// ```dart
+/// // sqflite
+/// final executor = CallbackSqlExecutor<DatabaseExecutor>(
+///   connection: db,
+///   execute: (c, sql, args) => c.execute(sql, args),
+///   query: (c, sql, args) => c.rawQuery(sql, args),
+///   transaction: (action) => db.transaction(action),
+/// );
+/// final sync = SyncEngine(store: SqlSyncStore(executor), ...);
+///
+/// await executor.transaction(() async {
+///   await executor.current.insert('notes', note.toMap());
+///   await sync.recordCreate('notes', note.id, note.toJson());
+/// });
+/// ```
+///
+/// ```dart
+/// // drift: transactions already follow the zone.
+/// CallbackSqlExecutor<GeneratedDatabase>(
+///   connection: db,
+///   execute: (db, sql, args) => db.customStatement(sql, args),
+///   query: (db, sql, args) async => [
+///     for (final row in await db.customSelect(sql,
+///         variables: [for (final a in args) Variable(a)]).get())
+///       row.data,
+///   ],
+///   transaction: (action) => db.transaction(() => action(db)),
+/// );
+/// ```
+///
+/// ```dart
+/// // sqlite3 (synchronous API)
+/// CallbackSqlExecutor<Database>(
+///   connection: db,
+///   execute: (db, sql, args) async => db.execute(sql, args),
+///   query: (db, sql, args) async =>
+///       [for (final row in db.select(sql, args)) Map.of(row)],
+///   transaction: (action) async {
+///     db.execute('BEGIN');
+///     try {
+///       await action(db);
+///       db.execute('COMMIT');
+///     } catch (_) {
+///       db.execute('ROLLBACK');
+///       rethrow;
+///     }
+///   },
+/// );
+/// ```
+class CallbackSqlExecutor<C> implements SqlExecutor {
+  CallbackSqlExecutor({
+    required this.connection,
+    required Future<void> Function(C connection, String sql, List<Object?> args)
+        execute,
+    required Future<List<Map<String, Object?>>> Function(
+            C connection, String sql, List<Object?> args)
+        query,
+    required Future<void> Function(Future<void> Function(C transaction) action)
+        transaction,
+  })  : _execute = execute,
+        _query = query,
+        _transaction = transaction;
+
+  /// The connection used outside transactions.
+  final C connection;
+
+  final Future<void> Function(C connection, String sql, List<Object?> args)
+      _execute;
+  final Future<List<Map<String, Object?>>> Function(
+      C connection, String sql, List<Object?> args) _query;
+  final Future<void> Function(Future<void> Function(C transaction) action)
+      _transaction;
+
+  /// Per instance, so a transaction of another database is never joined.
+  final Object _zoneKey = Object();
+
+  /// The open transaction's connection inside [transaction], [connection]
+  /// elsewhere.
+  C get current {
+    final open = Zone.current[_zoneKey];
+    return open is _OpenTransaction<C> ? open.connection : connection;
+  }
+
+  @override
+  Future<void> execute(String sql, [List<Object?> args = const []]) =>
+      _execute(current, sql, args);
+
+  @override
+  Future<List<Map<String, Object?>>> query(String sql,
+          [List<Object?> args = const []]) =>
+      _query(current, sql, args);
+
+  /// Runs [action] in a transaction; nested calls join the open one.
+  @override
+  Future<T> transaction<T>(Future<T> Function() action) async {
+    if (Zone.current[_zoneKey] != null) return action();
+    late T result;
+    await _transaction((txn) async {
+      result = await runZoned(action,
+          zoneValues: {_zoneKey: _OpenTransaction<C>(txn)});
+    });
+    return result;
+  }
+}
+
+class _OpenTransaction<C> {
+  const _OpenTransaction(this.connection);
+  final C connection;
+}
+
 /// [SyncStore] on any SQLite database through a [SqlExecutor].
 ///
 /// Tables are created with `CREATE TABLE IF NOT EXISTS`, so no migration of
-/// your schema is needed. [tablePrefix] avoids clashes with your tables.
+/// your schema is needed. [tablePrefix] avoids clashes with your tables; it
+/// may hold letters, digits and underscores.
 class SqlSyncStore implements SyncStore {
-  SqlSyncStore(this.executor, {this.tablePrefix = 'sync_'});
+  SqlSyncStore(this.executor, {this.tablePrefix = 'sync_'}) {
+    // The prefix is part of table names written into SQL, never a bound
+    // value: anything else would break the statements.
+    if (!RegExp(r'^([A-Za-z_][A-Za-z0-9_]*)?$').hasMatch(tablePrefix)) {
+      throw ArgumentError.value(tablePrefix, 'tablePrefix',
+          'may only hold letters, digits and underscores');
+    }
+  }
 
   final SqlExecutor executor;
   final String tablePrefix;
