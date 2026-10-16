@@ -117,6 +117,7 @@ SyncEntityConfig entity(
   UnknownReferencePolicy unknownReferencePolicy =
       UnknownReferencePolicy.passThrough,
   Object Function(String serverId)? serverIdToJson,
+  Object? Function(Map<String, dynamic> record)? clientIdOf,
   DateTime? Function(Map<String, dynamic> record)? updatedAtOf,
   bool Function(Map<String, dynamic> record)? isDeletedOf,
   RemoteAdapter? remote,
@@ -134,6 +135,7 @@ SyncEntityConfig entity(
       coalesce: coalesce,
       unknownReferencePolicy: unknownReferencePolicy,
       serverIdToJson: serverIdToJson,
+      clientIdOf: clientIdOf,
       updatedAtOf: updatedAtOf,
       isDeletedOf: isDeletedOf,
       pullPageSize: pullPageSize,

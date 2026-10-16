@@ -217,15 +217,84 @@ void main() {
     await sync.registerMapping('notes', 'b', '101');
     await sync.recordUpdate('notes', 'b', {'text': 'edited'});
     final deleted = <String>[];
-    sync.events
-        .where((e) => e.type == SyncEventType.recordDeletedByServer)
-        .listen((e) => deleted.add(e.localId!));
+    final dropped = <SyncEvent>[];
+    sync.events.listen((e) {
+      switch (e.type) {
+        case SyncEventType.recordDeletedByServer:
+          deleted.add(e.localId!);
+        case SyncEventType.operationDiscarded:
+          dropped.add(e);
+        default:
+      }
+    });
 
     await sync.pullNow();
+    await settle();
 
     expect(db.table('notes'), isEmpty);
     expect(await sync.pendingOperations(), isEmpty);
     expect(deleted, ['a', 'b']);
+    // The lost local edit is reported, so the app can tell the user.
+    expect(dropped.single.localId, 'b');
+    expect(dropped.single.message, contains('deleted on the server'));
+  });
+
+  group('own records seen in a pull (clientIdOf)', () {
+    // The server saves the create but answers 502; a pull runs before the
+    // create is retried.
+    Future<SyncEngine> lostResponse({bool echoClientId = true}) async {
+      final sync = engine([
+        entity('notes', server, db,
+            pullMode: PullMode.fullRefresh,
+            clientIdOf: echoClientId ? (r) => r['clientId'] : null),
+      ]);
+      var first = true;
+      server.onPush = (r) {
+        if (!first) return null;
+        first = false;
+        server.seed('notes', {...r.payload});
+        return const PushOutcome.retry('502 Bad Gateway');
+      };
+      db.table('notes')['a'] = {'text': 'hi', 'clientId': 'a'};
+      await sync.recordCreate('notes', 'a', {'text': 'hi', 'clientId': 'a'});
+      return sync;
+    }
+
+    test('are linked to the local record instead of stored twice', () async {
+      final sync = await lostResponse();
+      final result = await sync.syncNow();
+
+      expect(db.table('notes').keys, ['a']);
+      expect(await sync.serverIdOf('notes', 'a'), '100');
+      expect(db.serverIdsAssigned, ['notes/a=100']);
+      expect(result.pulled, 0); // the local copy won (keepLocal)
+
+      // The queued create now goes out as an update of record 100.
+      await sync.syncNow(ignoreBackoff: true);
+      expect(server.pushes.last.type, SyncOpType.update);
+      expect(server.pushes.last.serverId, '100');
+      expect(server.table('notes'), hasLength(1));
+      expect(await sync.pendingOperations(), isEmpty);
+    });
+
+    test('without clientIdOf the record is stored twice', () async {
+      final sync = await lostResponse(echoClientId: false);
+      await sync.syncNow();
+      expect(db.table('notes'), hasLength(2));
+    });
+
+    test('never take over a record that already has a server id', () async {
+      final sync = engine([
+        entity('notes', server, db,
+            pullMode: PullMode.fullRefresh, clientIdOf: (r) => r['clientId']),
+      ]);
+      await sync.registerMapping('notes', 'a', '7');
+      server.seed('notes', {'text': 'other', 'clientId': 'a'});
+      await sync.pullNow();
+      expect(await sync.serverIdOf('notes', 'a'), '7');
+      expect(db.table('notes'), hasLength(1));
+      expect(db.table('notes').keys.single, isNot('a'));
+    });
   });
 
   group('pull conflicts', () {
@@ -344,6 +413,37 @@ void main() {
       ]);
       await sync.pullNow();
       expect(sync.status.value.phase, SyncPhase.authRequired);
+    });
+
+    test('onUnauthorized lets the pull retry the page', () async {
+      var token = 'old';
+      final sync = engine(
+        [
+          entity('a', server, db,
+              pullMode: PullMode.incremental,
+              remote: _pages({
+                null: () => token == 'old'
+                    ? throw const SyncUnauthorizedException()
+                    : const PullPage(records: [
+                        {'id': 100},
+                      ], nextCursor: 'c1'),
+              })),
+        ],
+        config: SyncConfig(
+          syncOnStart: false,
+          syncOnResume: false,
+          autoPushAfterWrite: false,
+          periodicInterval: null,
+          onUnauthorized: () {
+            token = 'new';
+            return true;
+          },
+        ),
+      );
+      final result = await sync.pullNow();
+      expect(result.completed, isTrue);
+      expect(result.pulled, 1);
+      expect(sync.status.value.phase, SyncPhase.idle);
     });
 
     test('other errors are reported and the next entities still pull',
