@@ -55,5 +55,22 @@ void main() {
     await tester.tap(find.byTooltip('Sync now'));
     await syncs(tester);
     expect(find.text('Written on another device'), findsOneWidget);
+
+    // A rejected note the user discards, then deletes: nothing is left to
+    // sync, and nothing is reported as failed.
+    await tester.tap(find.text('Server rejects changes'));
+    await tester.tap(find.byIcon(Icons.add));
+    await syncs(tester);
+    expect(find.text('1 change(s) need attention'), findsOneWidget);
+    await tester.tap(find.text('Discard'));
+    await tester.tap(find.text('Server rejects changes'));
+    await syncs(tester);
+    await tester.tap(find.descendant(
+      of: find.widgetWithText(ListTile, 'Note 3'),
+      matching: find.byIcon(Icons.delete_outline),
+    ));
+    await syncs(tester);
+    expect(find.text('Note 3'), findsNothing);
+    expect(find.text('Everything is synced'), findsOneWidget);
   });
 }

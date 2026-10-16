@@ -35,8 +35,12 @@ without overwriting edits that have not been pushed yet.
   lost.
 - **UI-ready state** — a `ValueListenable<SyncStatus>`, per-record state
   streams, and an event stream.
-- **No mandatory dependencies** — use drift, sqflite, or any SQLite for
-  storage, and `http`, `dio`, or anything else for the network.
+- **Works with your stack** — no mandatory dependencies. Keep the outbox in
+  drift, sqflite, sqlite3 or any SQLite (in the same transaction as your
+  rows), or in Hive, SharedPreferences, Isar or any key/value store; talk to
+  REST through `http` or `dio`, or to GraphQL, Supabase or Firebase; follow
+  the status with `ValueListenable`, Streams, Provider, Riverpod, Bloc or
+  GetX. See [Works with your stack](#works-with-your-stack).
 
 ## How it works
 
@@ -61,7 +65,7 @@ For each entity (table) you provide:
 
 ```dart
 final sync = SyncEngine(
-  store: SqlSyncStore(DriftSqlExecutor(db)), // or InMemorySyncStore()
+  store: SqlSyncStore(executor), // see Storage; or KeyValueSyncStore(...)
   connectivity: StreamConnectivity(
     initial: await InternetConnection().hasInternetAccess,
     changes: InternetConnection().onStatusChange
@@ -180,7 +184,8 @@ change and re-queues it with a fresh attempt budget — the usual case for a
 validation error the user just corrected.
 
 `sync.events` reports what happens (`operationRecorded`, `operationPushed`,
-`operationFailed`, `operationRetried`, `operationDiscarded`, `recordPulled`,
+`operationFailed`, `operationRetried`, `operationDiscarded` (also sent when
+the server deleted a record that had unpushed changes), `recordPulled`,
 `recordDeletedByServer`, `conflictResolved`, `runStarted`, `runFinished`,
 `storeCleared`), for logging or refreshing a screen.
 
@@ -253,7 +258,7 @@ follows:
 | `isAlreadyExists` returns true for a create | success: the existing record is adopted |
 | 409 | conflict |
 | 404 to a delete | success (already gone) |
-| 408, 425, 429, 5xx | retry, honoring `Retry-After` (seconds or HTTP date) |
+| 408, 425, 429, 5xx | retry, honoring a `Retry-After` (seconds or HTTP date) longer than the retry policy's delay |
 | anything else, including 3xx and 403 | rejected: the operation is kept as failed |
 
 403 usually means "not allowed for this record", so it fails that one
@@ -262,7 +267,8 @@ operation instead of stopping all sync; use `unauthorizedStatusCodes: {401,
 read from `message`, RFC 7807 problem details (`title`, `detail`) and
 validation `errors`; override `errorMessage` to customize them.
 
-The transport is your choice:
+The transport is your choice (a `dio` version is in
+[Network](#network)):
 
 ```dart
 Future<RestResponse> transport(RestRequest r) async {
@@ -298,45 +304,270 @@ For any unusual API, implement `RemoteAdapter` directly and return a
 | `conflict` | Server holds a newer version | The conflict resolver decides |
 | `unauthorized` | Token expired | Sync stops, `SyncPhase.authRequired` |
 
-### SQL store
+## Works with your stack
+
+The engine only talks to interfaces, so it plugs into the database, backend
+and state management your app already uses. No adapter package is needed.
+
+### Storage
+
+| Your app keeps its data in | Use |
+|---|---|
+| SQLite: drift, sqflite, sqlite3, floor, SQLCipher | `SqlSyncStore` + `CallbackSqlExecutor`: the outbox lives in your database and commits with your rows |
+| Hive, SharedPreferences, Isar, ObjectBox, GetStorage, secure storage | `KeyValueSyncStore` + `CallbackKeyValueStorage` |
+| Tests, prototypes | `InMemorySyncStore` |
+| Anything else | implement `SyncStore` |
 
 `SqlSyncStore` creates three tables (`sync_outbox`, `sync_id_map`,
-`sync_meta`) using `IF NOT EXISTS`, so your schema needs no migration. Put it
-in the same database as your data so a record and its operation are saved to
-the outbox together.
-
-Implement `SqlExecutor` on top of your database — see its doc comment for a
-five-line `drift` example. For `sqflite`, route queries to the currently open
-transaction through a `Zone`, so writes inside `SqlSyncStore.transaction`
-land in the same transaction as your own:
+`sync_meta`) with `IF NOT EXISTS`, so your schema needs no migration.
+`CallbackSqlExecutor` routes the statements of a transaction to that
+transaction, so a row and its outbox entry commit (or roll back) together:
 
 ```dart
-class SqfliteExecutor implements SqlExecutor {
-  SqfliteExecutor(this.db);
-  final Database db;
-  final _txn = Object(); // per instance: never joins another database's
+// sqflite (or sqflite_sqlcipher)
+final executor = CallbackSqlExecutor<DatabaseExecutor>(
+  connection: db,
+  execute: (c, sql, args) => c.execute(sql, args),
+  query: (c, sql, args) => c.rawQuery(sql, args),
+  transaction: (action) => db.transaction(action),
+);
+final sync = SyncEngine(store: SqlSyncStore(executor), /* ... */);
 
-  DatabaseExecutor get _current => Zone.current[_txn] as DatabaseExecutor? ?? db;
+await executor.transaction(() async {
+  await executor.current.insert('notes', note.toMap()); // the transaction
+  await sync.recordCreate('notes', note.id, note.toJson());
+});
+```
 
-  @override
-  Future<void> execute(String sql, [List<Object?> args = const []]) =>
-      _current.execute(sql, args);
+```dart
+// drift: its transactions already follow the zone.
+final executor = CallbackSqlExecutor<GeneratedDatabase>(
+  connection: db,
+  execute: (db, sql, args) => db.customStatement(sql, args),
+  query: (db, sql, args) async => [
+    for (final row in await db
+        .customSelect(sql, variables: [for (final a in args) Variable(a)])
+        .get())
+      row.data,
+  ],
+  transaction: (action) => db.transaction(() => action(db)),
+);
 
-  @override
-  Future<List<Map<String, Object?>>> query(String sql,
-          [List<Object?> args = const []]) =>
-      _current.rawQuery(sql, args);
+await db.transaction(() async {
+  await db.into(db.notes).insert(row);
+  await sync.recordCreate('notes', id, data);
+});
+```
 
-  @override
-  Future<T> transaction<T>(Future<T> Function() action) {
-    if (Zone.current[_txn] != null) return action();
-    return db.transaction((txn) => runZoned(action, zoneValues: {_txn: txn}));
-  }
+`CallbackSqlExecutor`'s documentation also shows `sqlite3`. You can still
+implement `SqlExecutor` yourself.
+
+Without SQLite, `KeyValueSyncStore` saves the outbox as one JSON value after
+every change. It suits outboxes of up to a few thousand operations.
+
+```dart
+// SharedPreferences
+final prefs = await SharedPreferences.getInstance();
+final store = KeyValueSyncStore(CallbackKeyValueStorage(
+  read: (key) async => prefs.getString(key),
+  write: (key, value) async => value == null
+      ? await prefs.remove(key)
+      : await prefs.setString(key, value),
+));
+
+// Hive
+final box = await Hive.openBox<String>('sync');
+final store = KeyValueSyncStore(CallbackKeyValueStorage(
+  read: (key) async => box.get(key),
+  write: (key, value) => value == null ? box.delete(key) : box.put(key, value),
+));
+```
+
+A key/value store cannot share a transaction with your data, so record each
+change right after writing it. Give each signed-in account its own `key` to
+keep their outboxes apart.
+
+### Network
+
+| Your backend | Use |
+|---|---|
+| REST through `http`, `dio`, chopper, retrofit | `RestRemoteAdapter` with a transport (see [Remote adapter](#remote-adapter)) |
+| GraphQL, Supabase, Firebase, gRPC, anything else | `CallbackRemoteAdapter`, or extend `RemoteAdapter` |
+
+A `dio` transport. Let dio throw only for connection problems; the adapter
+reads every status code itself:
+
+```dart
+Future<RestResponse> transport(RestRequest r) async {
+  final response = await dio.request<Object?>(
+    r.path,
+    data: r.body,
+    queryParameters: r.query,
+    options: Options(
+      method: r.method,
+      headers: r.headers,
+      validateStatus: (_) => true,
+    ),
+  );
+  return RestResponse(
+    statusCode: response.statusCode ?? 0,
+    body: response.data,
+    headers: {
+      for (final h in response.headers.map.entries) h.key: h.value.join(', '),
+    },
+  );
 }
 ```
 
-Run your own writes through the same executor's `transaction` (or
-`sync.store.transaction`) so a row and its outbox entry commit together.
+dio's connection and timeout errors (dio 4 and 5), `package:http`'s
+`ClientException`, socket errors and GraphQL `NetworkException`s are all
+recognized as "offline" by `isNetworkError`.
+
+A backend without REST, here Supabase:
+
+```dart
+final notes = supabase.from('notes');
+CallbackRemoteAdapter(
+  push: (r) async {
+    switch (r.type) {
+      case SyncOpType.create:
+        final row = await notes.insert(r.payload).select('id').single();
+        return PushOutcome.success(serverId: '${row['id']}');
+      case SyncOpType.update:
+        await notes.update(r.payload).eq('id', r.serverId!);
+        return const PushOutcome.success();
+      case SyncOpType.delete:
+        await notes.delete().eq('id', r.serverId!);
+        return const PushOutcome.success();
+    }
+  },
+  pull: (r) async {
+    final rows = await notes
+        .select()
+        .gte('updated_at', r.cursor ?? '1970-01-01')
+        .order('updated_at', ascending: true)
+        .limit(r.limit);
+    return PullPage(
+      records: rows,
+      hasMore: rows.length == r.limit,
+      nextCursor: rows.isEmpty ? r.cursor : rows.last['updated_at'] as String,
+    );
+  },
+);
+```
+
+### Sessions and tokens
+
+`canSync` pauses sync while nobody is signed in. When the server answers
+"unauthorized" during a run, `onUnauthorized` gets one chance to refresh the
+session; returning true retries at once:
+
+```dart
+SyncConfig(
+  canSync: () => auth.isSignedIn,
+  onUnauthorized: () => auth.refreshToken(), // Future<bool>
+)
+```
+
+If it returns false, sync stops with `SyncPhase.authRequired` until the next
+sync request (call `sync.syncNow()` after the user signs in again).
+
+### Connectivity
+
+Any stream of online/offline values works:
+
+```dart
+// connectivity_plus 6+
+StreamConnectivity(
+  initial: !(await Connectivity().checkConnectivity())
+      .contains(ConnectivityResult.none),
+  changes: Connectivity().onConnectivityChanged
+      .map((results) => !results.contains(ConnectivityResult.none)),
+)
+```
+
+Network errors always put the engine offline, whatever the source says.
+
+### State management
+
+`sync.status` is a `ValueListenable`; `sync.watchStatus()` is the same as a
+stream (the current status first, then every change).
+
+```dart
+// Provider
+StreamProvider<SyncStatus>(
+  create: (_) => sync.watchStatus(),
+  initialData: sync.status.value,
+  child: const App(),
+);
+
+// Riverpod
+final syncStatusProvider =
+    StreamProvider<SyncStatus>((ref) => sync.watchStatus());
+
+// Bloc
+class SyncCubit extends Cubit<SyncStatus> {
+  SyncCubit(SyncEngine sync) : super(sync.status.value) {
+    _subscription = sync.watchStatus().listen(emit);
+  }
+  late final StreamSubscription<SyncStatus> _subscription;
+
+  @override
+  Future<void> close() async {
+    await _subscription.cancel();
+    return super.close();
+  }
+}
+
+// GetX
+final status = sync.status.value.obs..bindStream(sync.watchStatus());
+```
+
+`sync.events` and `sync.watchRecordState(entity, id)` are streams too.
+
+### Background sync
+
+The engine runs without `start()`, so a background task (for example with
+`workmanager`) can build one, sync once and dispose of it:
+
+```dart
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((task, input) async {
+    final sync = SyncEngine(
+      store: SqlSyncStore(await openExecutor()),
+      entities: buildEntities(),
+      config: const SyncConfig(syncOnResume: false, periodicInterval: null),
+    );
+    try {
+      return (await sync.syncNow()).completed;
+    } finally {
+      await sync.dispose();
+    }
+  });
+}
+```
+
+Idempotency keys keep a change from being applied twice if the app and the
+background task both send it.
+
+### Servers that store the client id
+
+If your server keeps the id the device generated (for example a `clientId`
+column), send it and tell the engine where to find it in pulled records:
+
+```dart
+SyncEntityConfig(
+  name: 'notes',
+  clientIdOf: (record) => record['clientId'],
+  // ...
+);
+await sync.recordCreate('notes', id, {'clientId': id, ...note.toJson()});
+```
+
+Then a create that reached the server but whose response was lost (a
+timeout, a 502 after the save) is recognized when it is pulled back, instead
+of being stored twice on the device.
 
 ## Pulling
 
@@ -383,21 +614,27 @@ a push that the server answered with `conflict`.
 SyncConfig(
   retryPolicy: RetryPolicy(maxAttempts: 8, baseDelay: Duration(seconds: 2)),
   debounce: Duration(milliseconds: 800),
+  maxDebounce: Duration(seconds: 5), // writes never delay a sync longer
   periodicInterval: Duration(minutes: 5),
   syncOnStart: true, syncOnResume: true, syncOnReconnect: true,
   autoPushAfterWrite: true,
   canSync: () => auth.isLoggedIn,
+  onUnauthorized: () => auth.refreshToken(),
   onOperationFailed: (op, error) => showSnack('${op.entity}: $error'),
   logger: (level, message, [error, stack]) => debugPrint('[sync] $message'),
 );
 ```
 
 Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushEnabled`,
-`coalesce`, `mergePayload`, `serverIdOf`, `serverIdToJson`, `updatedAtOf`,
-`isDeletedOf` (for server-deleted records), and `unknownReferencePolicy`.
+`coalesce`, `mergePayload`, `serverIdOf`, `serverIdToJson`, `clientIdOf`,
+`updatedAtOf`, `isDeletedOf` (for server-deleted records), and
+`unknownReferencePolicy`.
 
 `syncNow`, `pushNow` and `pullNow` accept `entities: {...}` to limit a run.
-`clear()` (for logout) and `resetPullCursor()` wait for a run in progress.
+Operations that hit a temporary failure wait out their backoff delay; a
+"Sync now" button should call `syncNow(ignoreBackoff: true)` to try them
+again at once. `clear()` (for logout) and `resetPullCursor()` wait for a run
+in progress.
 
 ## Testing
 
@@ -420,15 +657,23 @@ final result = await sync.syncNow();
 expect(result.pushed, 1);
 ```
 
-To test against real SQLite, use `SqlSyncStore` with the executor above and
+`InMemorySyncStore` stores payloads as JSON, like a database: a payload a
+database cannot store (a `DateTime`, say) fails in tests too. To test against
+real SQLite, use `SqlSyncStore` with `CallbackSqlExecutor` and
 `sqflite_common_ffi`.
 
 ## Migrating an existing app
 
-1. Register existing rows once:
-   `await sync.registerMapping('customers', row.id, row.serverId)`, or
-   implement `LocalAdapter.findServerId`/`findLocalId` to read a `server_id`
-   column on demand.
+1. Register existing rows once, in one transaction:
+
+   ```dart
+   await sync.registerMappings('customers', {
+     for (final r in rows) if (r.serverId != null) r.id: r.serverId!,
+   });
+   ```
+
+   or implement `LocalAdapter.findServerId`/`findLocalId` to read a
+   `server_id` column on demand.
 2. Enqueue rows that were never pushed (`is_sync = 0`) via
    `recordCreate`/`recordUpdate`.
 3. Route every create, update and delete in the app through the local
