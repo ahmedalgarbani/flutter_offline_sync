@@ -261,6 +261,18 @@ class CountingStore extends InMemorySyncStore {
   }
 
   @override
+  Future<void> updateOperation(SyncOperation operation) {
+    _called('updateOperation');
+    return super.updateOperation(operation);
+  }
+
+  @override
+  Future<void> markOperations(Iterable<String> ids, SyncOpStatus status) {
+    _called('markOperations');
+    return super.markOperations(ids, status);
+  }
+
+  @override
   Future<T> transaction<T>(Future<T> Function() action) {
     _called('transaction');
     return super.transaction(action);

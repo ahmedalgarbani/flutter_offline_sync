@@ -200,6 +200,55 @@ void main() {
           ['create', 'create', 'update']);
     });
 
+    test('records waiting for a failed parent are not rewritten on every sync',
+        () async {
+      var reject = true;
+      server.onPush = (r) => reject && r.entity == 'customers'
+          ? const PushOutcome.rejected('Name is required')
+          : null;
+      final sync = engine([
+        entity('bills', server, db,
+            references: [SyncReference('customerId', 'customers')]),
+        entity('customers', server, db),
+        entity('notes', server, db),
+      ]);
+      await sync.recordCreate('customers', 'c1', {'name': ''});
+      for (var i = 0; i < 20; i++) {
+        await sync.recordCreate('bills', 'b$i', {'customerId': 'c1'});
+      }
+      final first = await sync.syncNow();
+      expect(first.failed, 1);
+      expect(first.waiting, 20);
+      expect((await sync.operationsOf('bills', 'b7')).single.lastError,
+          'Waiting for customers/c1, whose sync failed');
+
+      // While nothing changes for them, later syncs only look: no write to
+      // the outbox, and one look at the customer for all twenty bills.
+      store.calls.clear();
+      await sync.recordCreate('notes', 'n1', {});
+      final second = await sync.syncNow();
+      final third = await sync.syncNow();
+      expect(second.pushed, 1);
+      expect(second.waiting, 20);
+      expect(third.waiting, 20);
+      expect(store.count('updateOperation'), 0);
+      // Only the note was claimed.
+      expect(store.count('markOperations'), 1);
+      expect(store.count('operationsFor'), lessThan(12));
+      expect(sync.status.value.pendingCount, 20);
+
+      // The customer is fixed: everything follows in one run.
+      reject = false;
+      await sync.recordUpdate('customers', 'c1', {'name': 'Ann'});
+      final fixed = await sync.syncNow();
+      expect(fixed.pushed, 21);
+      expect(fixed.waiting, 0);
+      final customer = await sync.serverIdOf('customers', 'c1');
+      expect(server.table('bills').values.map((b) => b['customerId']),
+          everyElement(customer));
+      expect(sync.status.value.isUpToDate, isTrue);
+    });
+
     test('pendingOperations and failedOperations can be read in pages',
         () async {
       server.onPush = (r) => r.localId.startsWith('bad')

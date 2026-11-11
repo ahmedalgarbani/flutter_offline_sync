@@ -743,6 +743,10 @@ class SyncEngine with WidgetsBindingObserver {
   Future<bool> _pushPass(SyncRunResult result, Set<String>? only) async {
     var progress = false;
     var afterSeq = 0;
+    // What is learnt in this pass about the records that others wait for.
+    // It may go stale during the pass, but only by something being pushed,
+    // and then another pass follows.
+    final waitedFor = _Mappings(store);
     while (result.abortedBy == null) {
       final page = await store.operationsPage(
         statuses: const {SyncOpStatus.pending},
@@ -773,7 +777,7 @@ class SyncEngine with WidgetsBindingObserver {
             records.add(page[index].localId)) {
           chunk.add(page[index++]);
         }
-        if (await _pushChunk(chunk, cfg, result)) progress = true;
+        if (await _pushChunk(chunk, cfg, result, waitedFor)) progress = true;
         await _refreshCounts();
       }
       if (page.length < _outboxPage) break;
@@ -789,8 +793,14 @@ class SyncEngine with WidgetsBindingObserver {
     List<SyncOperation> chunk,
     SyncEntityConfig cfg,
     SyncRunResult result,
+    _Mappings waitedFor,
   ) async {
-    final claimed = await _claim(cfg.name, chunk);
+    final ready = <SyncOperation>[];
+    for (final op in chunk) {
+      if (!await _stillWaiting(op, cfg, waitedFor)) ready.add(op);
+    }
+    if (ready.isEmpty) return false;
+    final claimed = await _claim(cfg.name, ready);
     if (claimed.isEmpty) return false;
     _setCurrent(SyncPhase.pushing, cfg.name);
 
@@ -832,6 +842,30 @@ class SyncEngine with WidgetsBindingObserver {
     }
     return progress;
   }
+
+  /// Whether [op], which waited for another record the last time it was
+  /// looked at, still waits for the same reason.
+  ///
+  /// Such an operation is left as it is. Claiming it and putting it back
+  /// writes to the outbox twice, and thousands of bills waiting for a
+  /// customer the server rejected would pay that on every sync until the
+  /// customer is fixed. Looking costs a few reads, shared by the operations
+  /// that wait for the same record.
+  Future<bool> _stillWaiting(
+      SyncOperation op, SyncEntityConfig cfg, _Mappings waitedFor) async {
+    final reason = op.lastError;
+    if (reason == null || !reason.startsWith(_waitPrefix)) return false;
+    try {
+      final prepared = await _prepare(op, cfg, waitedFor);
+      return prepared is _Wait && prepared.reason == reason;
+    } catch (_) {
+      // Let the normal path deal with (and report) the failure.
+      return false;
+    }
+  }
+
+  /// Every reason an operation waits for another record starts like this.
+  static const _waitPrefix = 'Waiting for ';
 
   /// Re-reads and claims operations of [entity], each of another record:
   /// the app may have merged new data into them, or removed them, since the
@@ -1190,12 +1224,12 @@ class SyncEngine with WidgetsBindingObserver {
     final mapping = await mappings.forLocal(target, localRef);
     if (mapping?.serverId != null) return _Resolved(mapping!.serverId);
 
-    final targetOps = await store.operationsFor(target, localRef);
-    if (targetOps.any((o) => o.isFailed)) {
-      return _Wait('Waiting for $target/$localRef, whose sync failed');
+    final queued = await mappings.queueOf(target, localRef);
+    if (queued.failed) {
+      return _Wait('$_waitPrefix$target/$localRef, whose sync failed');
     }
-    if (targetOps.any((o) => o.type == SyncOpType.create)) {
-      return _Wait('Waiting for $target/$localRef to be pushed');
+    if (queued.creating) {
+      return _Wait('$_waitPrefix$target/$localRef to be pushed');
     }
     if (mapping != null) {
       final waitReason = await _pendingCreatorOf(target, localRef);
@@ -1231,7 +1265,7 @@ class SyncEngine with WidgetsBindingObserver {
       await store.setMeta(key, null);
       return null;
     }
-    return 'Waiting for ${parts[0]}/${parts[1]}, which creates '
+    return '$_waitPrefix${parts[0]}/${parts[1]}, which creates '
         '$entity/$localId';
   }
 
@@ -2362,8 +2396,29 @@ class _Mappings {
       _known.putIfAbsent(entity, () => {})[localId] =
           IdMapping(entity: entity, localId: localId, serverId: serverId);
 
-  /// Forgets everything: mappings changed (operations were pushed).
-  void clear() => _known.clear();
+  /// What the outbox holds for a record others reference, by entity and
+  /// local id.
+  final Map<String, Map<String, ({bool failed, bool creating})>> _queued = {};
+
+  /// Whether the record has a failed operation, and whether its create is
+  /// still in the outbox.
+  Future<({bool failed, bool creating})> queueOf(
+      String entity, String localId) async {
+    final queued = _queued.putIfAbsent(entity, () => {});
+    final known = queued[localId];
+    if (known != null) return known;
+    final ops = await store.operationsFor(entity, localId);
+    return queued[localId] = (
+      failed: ops.any((o) => o.isFailed),
+      creating: ops.any((o) => o.type == SyncOpType.create),
+    );
+  }
+
+  /// Forgets everything: operations were pushed, so mappings changed.
+  void clear() {
+    _known.clear();
+    _queued.clear();
+  }
 }
 
 /// An operation the server accepted.
