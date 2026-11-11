@@ -208,6 +208,11 @@ class _NotesPageState extends State<NotesPage> {
           'Offline — ${status.pendingCount} change(s) saved locally',
           Colors.grey.shade300
         ),
+      SyncPhase.serverUnavailable => (
+          'The server is busy — ${status.pendingCount} change(s) will be '
+              'sent when it answers again',
+          Colors.orange.shade100
+        ),
       _ when status.failedCount > 0 => (
           '${status.failedCount} change(s) need attention',
           Colors.red.shade100

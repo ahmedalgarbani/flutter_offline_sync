@@ -42,6 +42,13 @@ class SyncReference {
     return copy;
   }
 
+  /// Like [rewrite], but changes [json] itself instead of a copy.
+  void rewriteInPlace(
+    Map<String, dynamic> json,
+    Object? Function(Object value) map,
+  ) =>
+      _rewrite(json, 0, map);
+
   void _read(Object? node, int index, List<Object> out) {
     if (node is! Map) return;
     final segment = _segments[index];

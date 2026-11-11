@@ -26,13 +26,18 @@ class SyncConfig {
     this.autoPushAfterWrite = true,
     this.pullOnSync = true,
     this.maxPushPasses = 10,
+    this.outboxPageSize = 200,
+    this.serverUnavailableThreshold = 3,
     this.canSync,
     this.onUnauthorized,
     this.classifyError = defaultClassifyError,
     this.onOperationFailed,
     this.logger,
     this.clock,
-  }) : assert(maxPushPasses > 0);
+  })  : assert(maxPushPasses > 0),
+        assert(outboxPageSize > 0),
+        assert(serverUnavailableThreshold == null ||
+            serverUnavailableThreshold > 0);
 
   final RetryPolicy retryPolicy;
 
@@ -66,6 +71,25 @@ class SyncConfig {
   /// Push passes per run. A later pass picks up operations that became
   /// ready because their parent was pushed in an earlier pass.
   final int maxPushPasses;
+
+  /// How many operations are read from the outbox at a time while pushing.
+  /// The outbox is never loaded whole, so memory use does not grow with it.
+  /// (A page always holds at least one full `pushBatchSize` batch.)
+  final int outboxPageSize;
+
+  /// After this many pushes in a row answered "the server is unavailable"
+  /// (HTTP 429, 502, 503 or 504 with `RestRemoteAdapter`, or
+  /// `PushOutcome.retry(..., serverUnavailable: true)`), the run stops and
+  /// reports `SyncPhase.serverUnavailable`, as it would stop for a lost
+  /// connection. The rest of the outbox is not sent, so an outage does not
+  /// use up the attempts of every operation, and a server that is
+  /// struggling is not hit with the whole backlog of every device.
+  ///
+  /// Sync then resumes by itself after the retry policy's delay (or the
+  /// server's `Retry-After`, when longer); the delay grows while the server
+  /// stays unavailable, and one such answer is then enough to pause again.
+  /// `syncNow(ignoreBackoff: true)` tries at once. Null never stops.
+  final int? serverUnavailableThreshold;
 
   /// Gate checked before each run, e.g. "user is logged in and the session
   /// is valid". Returning false pauses sync without touching the outbox.

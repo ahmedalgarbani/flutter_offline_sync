@@ -50,6 +50,7 @@ class SyncEntityConfig {
     this.isDeletedOf,
     this.pullMode = PullMode.incremental,
     this.pullPageSize = 500,
+    this.pushBatchSize = 1,
     this.pushEnabled = true,
     this.coalesce = true,
     this.mergePayload = _shallowMerge,
@@ -58,6 +59,7 @@ class SyncEntityConfig {
     this.unknownReferencePolicy = UnknownReferencePolicy.passThrough,
   })  : assert(name.isNotEmpty),
         assert(pullPageSize > 0),
+        assert(pushBatchSize > 0),
         conflictResolver = conflictResolver ??
             resolverFor(conflictStrategy, updatedAtOf: updatedAtOf);
 
@@ -107,7 +109,25 @@ class SyncEntityConfig {
   final bool Function(Map<String, dynamic> record)? isDeletedOf;
 
   final PullMode pullMode;
+
+  /// Records requested per pulled page. A page is looked up and written as
+  /// a whole (see `LocalAdapter.applyRemoteBatch`), so larger pages mean
+  /// fewer requests and fewer transactions for a large first download.
   final int pullPageSize;
+
+  /// How many operations of this entity are sent to the server together
+  /// (1 sends them one after the other).
+  ///
+  /// With a `RemoteAdapter` that implements `pushBatch` they go in one
+  /// request, for a bulk endpoint. With any other adapter they are sent as
+  /// that many `push` calls side by side, which already multiplies the
+  /// upload speed of a large outbox; keep it small then (4 to 8), as each
+  /// is a request of its own.
+  ///
+  /// Only operations that follow each other in the outbox and belong to
+  /// different records are grouped, and each still waits for the records
+  /// it references, so the order guarantees are the same as with 1.
+  final int pushBatchSize;
 
   /// Set to false for read-only entities.
   final bool pushEnabled;

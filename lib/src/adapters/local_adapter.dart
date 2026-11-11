@@ -1,5 +1,23 @@
 import '../core/operation.dart';
 
+/// One pulled record to write locally (see [LocalAdapter.applyRemoteBatch]).
+class RemoteChange {
+  const RemoteChange({
+    required this.record,
+    required this.localId,
+    required this.serverId,
+  });
+
+  /// The record in local form: references already hold local ids.
+  final Map<String, dynamic> record;
+
+  /// The known local id for [serverId], or null when the record is new on
+  /// this device.
+  final String? localId;
+
+  final String serverId;
+}
+
 /// Writes server data into the app's own tables for one entity.
 ///
 /// The engine never owns your data tables; it only keeps its own metadata
@@ -17,6 +35,35 @@ abstract class LocalAdapter {
     required String? localId,
     required String serverId,
   });
+
+  /// Inserts or updates the pulled records of one page and returns their
+  /// local ids, one per change and in the same order.
+  ///
+  /// The default calls [applyRemote] for each. Override it to write the
+  /// page with one statement or one database batch: for a first download of
+  /// hundreds of thousands of rows that is the difference between minutes
+  /// and seconds.
+  ///
+  /// ```dart
+  /// @override
+  /// Future<List<String>> applyRemoteBatch(List<RemoteChange> changes) async {
+  ///   final ids = [for (final c in changes) c.localId ?? newLocalId()];
+  ///   final batch = executor.current.batch(); // sqflite
+  ///   for (var i = 0; i < changes.length; i++) {
+  ///     batch.insert('products', toRow(ids[i], changes[i]),
+  ///         conflictAlgorithm: ConflictAlgorithm.replace);
+  ///   }
+  ///   await batch.commit(noResult: true);
+  ///   return ids;
+  /// }
+  /// ```
+  ///
+  /// It runs inside the page's transaction, like [applyRemote].
+  Future<List<String>> applyRemoteBatch(List<RemoteChange> changes) async => [
+        for (final change in changes)
+          await applyRemote(change.record,
+              localId: change.localId, serverId: change.serverId),
+      ];
 
   /// The server deleted the record.
   Future<void> applyRemoteDelete(String localId, {required String serverId});
@@ -60,6 +107,7 @@ class CallbackLocalAdapter extends LocalAdapter {
       required String? localId,
       required String serverId,
     }) applyRemote,
+    Future<List<String>> Function(List<RemoteChange> changes)? applyRemoteBatch,
     Future<void> Function(String localId, {required String serverId})?
         applyRemoteDelete,
     Future<void> Function(String localId, String serverId,
@@ -73,6 +121,7 @@ class CallbackLocalAdapter extends LocalAdapter {
     Future<String?> Function(String serverId)? findLocalId,
     Future<void> Function(Set<String> serverIds)? onFullRefreshComplete,
   })  : _applyRemote = applyRemote,
+        _applyRemoteBatch = applyRemoteBatch,
         _applyRemoteDelete = applyRemoteDelete,
         _onServerIdAssigned = onServerIdAssigned,
         _onPushed = onPushed,
@@ -86,6 +135,8 @@ class CallbackLocalAdapter extends LocalAdapter {
     required String? localId,
     required String serverId,
   }) _applyRemote;
+  final Future<List<String>> Function(List<RemoteChange> changes)?
+      _applyRemoteBatch;
   final Future<void> Function(String localId, {required String serverId})?
       _applyRemoteDelete;
   final Future<void> Function(String localId, String serverId,
@@ -105,6 +156,10 @@ class CallbackLocalAdapter extends LocalAdapter {
     required String serverId,
   }) =>
       _applyRemote(record, localId: localId, serverId: serverId);
+
+  @override
+  Future<List<String>> applyRemoteBatch(List<RemoteChange> changes) =>
+      _applyRemoteBatch?.call(changes) ?? super.applyRemoteBatch(changes);
 
   @override
   Future<void> applyRemoteDelete(String localId, {required String serverId}) =>

@@ -195,6 +195,22 @@ void main() {
       expect(seconds.retryAfter, const Duration(seconds: 30));
     });
 
+    test('429, 502, 503 and 504 say the server itself is unavailable',
+        () async {
+      for (final code in [429, 502, 503, 504]) {
+        final outcome =
+            await _classify(RestResponse(statusCode: code)) as PushRetry;
+        expect(outcome.serverUnavailable, isTrue, reason: '$code');
+      }
+      // These may be about the one record that was sent.
+      for (final code in [408, 425, 500, 501, 507]) {
+        final outcome =
+            await _classify(RestResponse(statusCode: code)) as PushRetry;
+        expect(outcome.serverUnavailable, isFalse, reason: '$code');
+      }
+      expect((PushOutcome.retry('x') as PushRetry).serverUnavailable, isFalse);
+    });
+
     test('Retry-After accepts seconds and HTTP dates', () {
       final now = DateTime.utc(2015, 10, 21, 7, 27, 30);
       expect(

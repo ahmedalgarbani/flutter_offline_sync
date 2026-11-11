@@ -534,4 +534,322 @@ void main() {
     await sync.syncNow(pull: false);
     expect(order, ['push', 'pull']);
   });
+
+  group('whole pages', () {
+    /// A local table written a page at a time; [batches] lists the server
+    /// ids of each call.
+    LocalAdapter batching(
+      String name,
+      List<List<String>> batches, {
+      List<String>? Function(List<RemoteChange> changes)? answer,
+    }) =>
+        CallbackLocalAdapter(
+          applyRemote: (record, {localId, required serverId}) =>
+              fail('applyRemote was called for $serverId'),
+          applyRemoteBatch: (changes) async {
+            batches.add([for (final c in changes) c.serverId]);
+            final ids = <String>[];
+            for (final change in changes) {
+              final id = change.localId ?? 'local-${change.serverId}';
+              db.table(name)[id] = Map.of(change.record);
+              ids.add(id);
+            }
+            return answer?.call(changes) ?? ids;
+          },
+          applyRemoteDelete: (localId, {required serverId}) async {
+            db.table(name).remove(localId);
+          },
+        );
+
+    test('a page is looked up and written as a whole', () async {
+      for (var i = 0; i < 5; i++) {
+        server.seed('customers', {'name': 'C$i'});
+      }
+      for (var i = 0; i < 7; i++) {
+        server.seed('bills', {'customerId': 100 + i % 5, 'total': i});
+      }
+      final counting = CountingStore();
+      final batches = <List<String>>[];
+      final sync = SyncEngine(
+        store: counting,
+        config: manualConfig,
+        entities: [
+          entity('bills', server, db,
+              pullMode: PullMode.incremental,
+              pullPageSize: 3,
+              local: batching('bills', batches),
+              references: [SyncReference('customerId', 'customers')]),
+          entity('customers', server, db,
+              pullMode: PullMode.incremental, pullPageSize: 3),
+        ],
+      );
+      addTearDown(sync.dispose);
+      final pulled = <String>[];
+      sync.events
+          .where((e) => e.type == SyncEventType.recordPulled)
+          .listen((e) => pulled.add('${e.entity}/${e.localId}=${e.message}'));
+      final result = await sync.pullNow();
+      final calls = Map.of(counting.calls);
+
+      expect(result.pulled, 12);
+      expect(result.errors, isEmpty);
+      expect(batches, [
+        ['105', '106', '107'],
+        ['108', '109', '110'],
+        ['111'],
+      ]);
+      final bill = db.table('bills')['local-108']!;
+      expect(bill['customerId'], await sync.localIdOf('customers', '103'));
+      expect(await sync.localIdOf('bills', '111'), 'local-111');
+      expect(await sync.serverIdOf('bills', 'local-105'), '105');
+      await settle();
+      expect(pulled, hasLength(12));
+      expect(pulled.last, 'bills/local-111=111');
+
+      // Five pages were applied: the store is asked per page (once for the
+      // page's own ids, once per referenced entity), never per record.
+      expect(calls['mappingForServer'], isNull);
+      expect(calls['mappingForLocal'], isNull);
+      expect(calls['operations'], isNull);
+      expect(calls['operationsFor'], isNull);
+      expect(calls['putMapping'], isNull);
+      expect(calls['putMappings'], 5);
+      expect(calls['localIdsWithOperations'], 5);
+      expect(calls['localIdsForServer'], 2 + 3 + 3);
+
+      // Pulled again, every row is known and updated in place.
+      batches.clear();
+      await sync.resetPullCursor('bills');
+      final again = await sync.pullNow(entities: {'bills'});
+      expect(again.pulled, 7);
+      expect(db.table('bills'), hasLength(7));
+      expect(batches.first, ['105', '106', '107']);
+    });
+
+    test('the default writes a page record by record', () async {
+      for (var i = 0; i < 5; i++) {
+        server.seed('notes', {'n': i});
+      }
+      final sync = engine([
+        entity('notes', server, db,
+            pullMode: PullMode.incremental, pullPageSize: 2),
+      ]);
+      expect((await sync.pullNow()).pulled, 5);
+      expect(db.table('notes').values.map((r) => r['n']), [0, 1, 2, 3, 4]);
+    });
+
+    test('a batch that returns the wrong number of ids is rolled back',
+        () async {
+      server.seed('notes', {'n': 0});
+      server.seed('notes', {'n': 1});
+      final batches = <List<String>>[];
+      final sync = engine([
+        entity('notes', server, db,
+            pullMode: PullMode.incremental,
+            local: batching('notes', batches, answer: (c) => ['only-one'])),
+      ]);
+      final result = await sync.pullNow();
+      expect(result.pulled, 0);
+      expect(result.errors.single, contains('applyRemoteBatch returned 1'));
+      expect(await sync.localIdOf('notes', '100'), isNull);
+      expect(await store.getMeta('cursor:notes'), isNull);
+    });
+
+    test('a record sent twice in one page is stored once', () async {
+      final batches = <List<String>>[];
+      final sync = engine([
+        SyncEntityConfig(
+          name: 'notes',
+          remote: _pages({
+            null: () => const PullPage(records: [
+                  {'id': 1, 'text': 'first'},
+                  {'id': 2, 'text': 'other'},
+                  {'id': 1, 'text': 'second'},
+                  {'id': 3, 'text': 'third'},
+                ], nextCursor: 'c1'),
+          }),
+          local: batching('notes', batches),
+        ),
+      ]);
+      final result = await sync.pullNow();
+      expect(result.pulled, 4);
+      expect(db.table('notes'), hasLength(3));
+      expect(db.table('notes')['local-1']!['text'], 'second');
+      expect(batches, [
+        ['1', '2'],
+        ['1', '3'],
+      ]);
+      expect(await sync.localIdOf('notes', '1'), 'local-1');
+    });
+
+    test('a record can reference another one of its own page', () async {
+      final batches = <List<String>>[];
+      final sync = engine([
+        SyncEntityConfig(
+          name: 'folders',
+          remote: _pages({
+            null: () => const PullPage(records: [
+                  {'id': 1, 'name': 'Root'},
+                  {'id': 2, 'name': 'Docs', 'parentId': 1},
+                  {'id': 3, 'name': 'Work', 'parentId': 2},
+                  {'id': 4, 'name': 'Play', 'parentId': 2},
+                  {'id': 5, 'name': 'Lost', 'parentId': 77},
+                ], nextCursor: 'c1'),
+          }),
+          local: batching('folders', batches),
+          references: [SyncReference('parentId', 'folders')],
+        ),
+      ]);
+      final result = await sync.pullNow();
+      expect(result.pulled, 5);
+      final folders = db.table('folders');
+      expect(folders['local-1']!.containsKey('parentId'), isFalse);
+      expect(folders['local-2']!['parentId'], 'local-1');
+      expect(folders['local-3']!['parentId'], 'local-2');
+      expect(folders['local-4']!['parentId'], 'local-2');
+      // Unknown on this device: left as the server sent it.
+      expect(folders['local-5']!['parentId'], 77);
+      // Only as many writes as the references need.
+      expect(batches, [
+        ['1'],
+        ['2'],
+        ['3', '4', '5'],
+      ]);
+    });
+
+    test('the records of the adapter are not changed', () async {
+      final records = [
+        {
+          'id': 5,
+          'customerId': 1,
+          'lines': [
+            {'itemId': 1},
+          ],
+        },
+      ];
+      final sync = engine([
+        SyncEntityConfig(
+          name: 'bills',
+          remote: _pages({
+            null: () => PullPage(records: records, nextCursor: 'c1'),
+          }),
+          local: db.adapter('bills'),
+          references: [
+            SyncReference('customerId', 'customers'),
+            SyncReference('lines[].itemId', 'customers'),
+          ],
+        ),
+        entity('customers', server, db),
+      ]);
+      await sync.registerMapping('customers', 'c-local', '1');
+      await sync.pullNow();
+      expect(db.table('bills').values.single, {
+        'id': 5,
+        'customerId': 'c-local',
+        'lines': [
+          {'itemId': 'c-local'},
+        ],
+      });
+      expect(records.single['customerId'], 1);
+      expect(records.single['lines'], [
+        {'itemId': 1},
+      ]);
+    });
+
+    test('conflicts and deletes keep their place in the page', () async {
+      final batches = <List<String>>[];
+      final resolved = <String>[];
+      final sync = engine([
+        SyncEntityConfig(
+          name: 'notes',
+          remote: _pages({
+            null: () => const PullPage(
+                  records: [
+                    {'id': 1, 'text': 'one'},
+                    {'id': 2, 'text': 'server two'},
+                    {'id': 3, 'text': 'three'},
+                    {'id': 4, 'text': 'server four'},
+                    {'id': 5, 'text': 'five'},
+                    {'id': 1, 'deleted': true},
+                    {'id': 6, 'text': 'six'},
+                  ],
+                  deletedServerIds: ['5', '99'],
+                  nextCursor: 'c1',
+                ),
+          }),
+          local: batching('notes', batches),
+          isDeletedOf: (record) => record['deleted'] == true,
+          conflictResolver: (conflict) {
+            resolved.add(conflict.serverId!);
+            return conflict.serverId == '2'
+                ? const ConflictResolution.keepLocal()
+                : const ConflictResolution.takeServer();
+          },
+        ),
+      ]);
+      db.table('notes')['two'] = {'text': 'old two'};
+      db.table('notes')['four'] = {'text': 'old four'};
+      await sync.registerMappings('notes', {'two': '2', 'four': '4'});
+      await sync.recordUpdate('notes', 'two', {'text': 'local two'});
+      await sync.recordUpdate('notes', 'four', {'text': 'local four'});
+      final deletedByServer = <String?>[];
+      sync.events
+          .where((e) => e.type == SyncEventType.recordDeletedByServer)
+          .listen((e) => deletedByServer.add(e.message));
+
+      final result = await sync.pullNow();
+
+      expect(result.errors, isEmpty);
+      expect(resolved, ['2', '4']);
+      // 1, 3, 4, 5 and 6 were written; 2 kept its local change.
+      expect(result.pulled, 5);
+      expect(batches, [
+        ['1'],
+        ['3'],
+        ['4', '5'],
+        ['6'],
+      ]);
+      final notes = db.table('notes');
+      expect(
+          notes.keys, unorderedEquals(['two', 'local-3', 'four', 'local-6']));
+      expect(notes['two']!['text'], 'old two');
+      expect(notes['four']!['text'], 'server four');
+      expect((await sync.operationsOf('notes', 'two')).single.force, isTrue);
+      expect(await sync.operationsOf('notes', 'four'), isEmpty);
+      await settle();
+      expect(deletedByServer, ['1', '5']);
+    });
+
+    test('several of its own records are recognized in one page', () async {
+      final sync = engine([
+        SyncEntityConfig(
+          name: 'notes',
+          remote: _pages({
+            null: () => const PullPage(records: [
+                  {'id': 1, 'clientId': 'a', 'text': 'A'},
+                  {'id': 2, 'clientId': 'zzz', 'text': 'someone else'},
+                  {'id': 3, 'clientId': 'b', 'text': 'B'},
+                  {'id': 4, 'clientId': 'a', 'text': 'a copy'},
+                ], nextCursor: 'c1'),
+          }),
+          local: db.adapter('notes'),
+          clientIdOf: (record) => record['clientId'],
+        ),
+      ]);
+      await sync.recordCreate('notes', 'a', {'clientId': 'a', 'text': 'A'});
+      await sync.recordCreate('notes', 'b', {'clientId': 'b', 'text': 'B'});
+      final result = await sync.pullNow();
+
+      expect(result.errors, isEmpty);
+      expect(await sync.serverIdOf('notes', 'a'), '1');
+      expect(await sync.serverIdOf('notes', 'b'), '3');
+      expect(db.serverIdsAssigned, ['notes/a=1', 'notes/b=3']);
+      // Their own two are linked (the unpushed local copy wins); the two
+      // that belong to nobody here are stored as new rows.
+      expect(db.table('notes'), hasLength(2));
+      expect(await sync.localIdOf('notes', '2'), isNotNull);
+      expect(await sync.localIdOf('notes', '4'), isNotNull);
+      expect(await sync.localIdOf('notes', '4'), isNot('a'));
+    });
+  });
 }

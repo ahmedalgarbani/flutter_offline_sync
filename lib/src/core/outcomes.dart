@@ -47,8 +47,18 @@ sealed class PushOutcome {
   /// Temporary server-side failure (5xx, 429, timeout). Counts as an attempt
   /// and is retried with backoff: after the retry policy's delay, or after
   /// [retryAfter] (the server's `Retry-After`) when that is longer.
-  const factory PushOutcome.retry(Object error, {Duration? retryAfter}) =
-      PushRetry;
+  ///
+  /// Set [serverUnavailable] when the failure says something about the
+  /// server rather than about this operation: it is overloaded, rate
+  /// limiting, or down for maintenance (HTTP 429, 502, 503, 504). After
+  /// `SyncConfig.serverUnavailableThreshold` such answers in a row the run
+  /// stops instead of sending the rest of the outbox to a server that
+  /// cannot take it.
+  const factory PushOutcome.retry(
+    Object error, {
+    Duration? retryAfter,
+    bool serverUnavailable,
+  }) = PushRetry;
 
   /// The server could not be reached. The push run stops without counting an
   /// attempt; it resumes on the next trigger.
@@ -76,9 +86,16 @@ class PushSuccess extends PushOutcome {
 }
 
 class PushRetry extends PushOutcome {
-  const PushRetry(this.error, {this.retryAfter});
+  const PushRetry(
+    this.error, {
+    this.retryAfter,
+    this.serverUnavailable = false,
+  });
   final Object error;
   final Duration? retryAfter;
+
+  /// The whole server is unavailable, not just this operation.
+  final bool serverUnavailable;
 }
 
 class PushNetworkError extends PushOutcome {
