@@ -163,7 +163,11 @@ class _OpenTransaction<C> {
 /// Tables are created with `CREATE TABLE IF NOT EXISTS`, so no migration of
 /// your schema is needed. [tablePrefix] avoids clashes with your tables; it
 /// may hold letters, digits and underscores.
-class SqlSyncStore implements SyncStore {
+///
+/// Built for large data sets: the outbox is read a page at a time through
+/// its indexes, and the id map is read and written a page of records per
+/// statement, so cost and memory do not grow with the number of rows.
+class SqlSyncStore extends SyncStore {
   SqlSyncStore(this.executor, {this.tablePrefix = 'sync_'}) {
     // The prefix is part of table names written into SQL, never a bound
     // value: anything else would break the statements.
@@ -185,6 +189,32 @@ class SqlSyncStore implements SyncStore {
   static const _opColumns = 'seq, id, entity, local_id, op_type, payload, '
       'status, attempts, force, created_at, updated_at, next_attempt_at, '
       'last_error';
+
+  /// Bound values per statement. SQLite before 3.32 (Android 10 and older)
+  /// accepts at most 999.
+  static const _maxVariables = 900;
+
+  static String _marks(int count) => List.filled(count, '?').join(', ');
+
+  /// Runs [body] for [values] in slices that fit one statement, [reserved]
+  /// bound values being used by the rest of the statement.
+  static Future<void> _chunked<T>(
+    Iterable<T> values,
+    Future<void> Function(List<T> chunk) body, {
+    int reserved = 1,
+    int perValue = 1,
+  }) async {
+    final size = (_maxVariables - reserved) ~/ perValue;
+    var chunk = <T>[];
+    for (final value in values) {
+      chunk.add(value);
+      if (chunk.length == size) {
+        await body(chunk);
+        chunk = <T>[];
+      }
+    }
+    if (chunk.isNotEmpty) await body(chunk);
+  }
 
   @override
   Future<void> init() async {
@@ -208,6 +238,11 @@ class SqlSyncStore implements SyncStore {
         'idx_${_outbox}_record ON $_outbox (entity, local_id)');
     await executor.execute('CREATE INDEX IF NOT EXISTS '
         'idx_${_outbox}_status ON $_outbox (status)');
+    // Only operations waiting out a backoff are in this index, so finding
+    // the next one that is due does not read the outbox.
+    await executor.execute('CREATE INDEX IF NOT EXISTS '
+        'idx_${_outbox}_retry ON $_outbox (next_attempt_at) '
+        'WHERE next_attempt_at IS NOT NULL');
     await executor.execute('''
       CREATE TABLE IF NOT EXISTS $_idMap (
         entity TEXT NOT NULL,
@@ -370,4 +405,224 @@ class SqlSyncStore implements SyncStore {
         await executor.execute('DELETE FROM $_idMap');
         await executor.execute('DELETE FROM $_meta');
       });
+
+  // Paged and batched access --------------------------------------------------
+
+  /// `column = ?` for one value, `column IN (?, ...)` for several.
+  static String _among(String column, int count) =>
+      count == 1 ? '$column = ?' : '$column IN (${_marks(count)})';
+
+  /// The status condition of a query that returns rows in `seq` order.
+  ///
+  /// For one status the status index yields the rows already in that order.
+  /// For several it would not, and SQLite would sort every matching row to
+  /// return one page; the `+` makes it walk the table in `seq` order
+  /// instead and stop when the page is full.
+  static String _statusInSeqOrder(int count) =>
+      count == 1 ? 'status = ?' : '+status IN (${_marks(count)})';
+
+  @override
+  Future<List<SyncOperation>> operationsPage({
+    Set<SyncOpStatus>? statuses,
+    Set<String>? entities,
+    DateTime? dueAt,
+    int afterSeq = 0,
+    required int limit,
+  }) async {
+    if (limit <= 0 ||
+        (statuses != null && statuses.isEmpty) ||
+        (entities != null && entities.isEmpty)) {
+      return [];
+    }
+    final where = <String>['seq > ?'];
+    final args = <Object?>[afterSeq];
+    if (statuses != null) {
+      where.add(_statusInSeqOrder(statuses.length));
+      args.addAll(statuses.map((s) => s.name));
+    }
+    if (entities != null) {
+      where.add(_among('entity', entities.length));
+      args.addAll(entities);
+    }
+    if (dueAt != null) {
+      where.add('(next_attempt_at IS NULL OR next_attempt_at <= ?)');
+      args.add(dueAt.millisecondsSinceEpoch);
+    }
+    final rows = await executor.query(
+        'SELECT $_opColumns FROM $_outbox WHERE ${where.join(' AND ')} '
+        'ORDER BY seq ASC LIMIT ?',
+        [...args, limit]);
+    return rows.map(SyncOperation.fromRow).toList();
+  }
+
+  @override
+  Future<List<SyncOperation>> operationsForRecords(
+      String entity, Iterable<String> localIds) async {
+    final all = <SyncOperation>[];
+    await _chunked<String>(localIds.toSet(), (chunk) async {
+      final rows = await executor.query(
+          'SELECT $_opColumns FROM $_outbox '
+          'WHERE entity = ? AND local_id IN (${_marks(chunk.length)}) '
+          'ORDER BY seq ASC',
+          [entity, ...chunk]);
+      all.addAll(rows.map(SyncOperation.fromRow));
+    });
+    // Several statements each return their rows in order; put them together.
+    if (all.length > 1) all.sort((a, b) => a.seq!.compareTo(b.seq!));
+    return all;
+  }
+
+  @override
+  Future<void> markOperations(Iterable<String> ids, SyncOpStatus status) =>
+      _inOneTransaction(ids, (chunk) {
+        return executor.execute(
+            'UPDATE $_outbox SET status = ? '
+            'WHERE id IN (${_marks(chunk.length)})',
+            [status.name, ...chunk]);
+      });
+
+  @override
+  Future<void> deleteOperations(Iterable<String> ids) =>
+      _inOneTransaction(ids, (chunk) {
+        return executor.execute(
+            'DELETE FROM $_outbox WHERE id IN (${_marks(chunk.length)})',
+            chunk);
+      }, reserved: 0);
+
+  /// Runs [body] over [ids] in slices; in a transaction only when more than
+  /// one statement is needed.
+  Future<void> _inOneTransaction(
+    Iterable<String> ids,
+    Future<void> Function(List<String> chunk) body, {
+    int reserved = 1,
+  }) {
+    final all = ids.toList();
+    if (all.isEmpty) return Future.value();
+    if (all.length <= _maxVariables - reserved) return body(all);
+    return transaction(() => _chunked<String>(all, body, reserved: reserved));
+  }
+
+  @override
+  Future<int> countOperations({
+    Set<SyncOpStatus>? statuses,
+    Set<String>? entities,
+  }) async {
+    if ((statuses != null && statuses.isEmpty) ||
+        (entities != null && entities.isEmpty)) {
+      return 0;
+    }
+    final where = <String>[];
+    final args = <Object?>[];
+    if (statuses != null) {
+      where.add(_among('status', statuses.length));
+      args.addAll(statuses.map((s) => s.name));
+    }
+    if (entities != null) {
+      where.add(_among('entity', entities.length));
+      args.addAll(entities);
+    }
+    final rows = await executor.query(
+        'SELECT COUNT(*) AS n FROM $_outbox'
+        '${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}',
+        args);
+    return (rows.first['n']! as num).toInt();
+  }
+
+  @override
+  Future<DateTime?> nextAttemptAfter(DateTime now) async {
+    final rows = await executor.query(
+        // The `+` keeps SQLite on the small index of the operations that
+        // wait for a retry, rather than reading every pending one.
+        'SELECT MIN(next_attempt_at) AS t FROM $_outbox '
+        'WHERE next_attempt_at > ? AND +status = ?',
+        [now.millisecondsSinceEpoch, SyncOpStatus.pending.name]);
+    final value = rows.isEmpty ? null : rows.first['t'] as num?;
+    return value == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(value.toInt());
+  }
+
+  @override
+  Future<void> clearBackoff(DateTime now, {Set<String>? entities}) async {
+    if (entities != null && entities.isEmpty) return;
+    await executor.execute(
+        'UPDATE $_outbox SET next_attempt_at = NULL '
+        'WHERE next_attempt_at > ? AND +status = ?'
+        '${entities == null ? '' : ' AND +${_among('entity', entities.length)}'}',
+        [
+          now.millisecondsSinceEpoch,
+          SyncOpStatus.pending.name,
+          ...?entities,
+        ]);
+  }
+
+  @override
+  Future<Set<String>> localIdsWithOperations(
+      String entity, Iterable<String> localIds) async {
+    final found = <String>{};
+    await _chunked<String>(localIds.toSet(), (chunk) async {
+      final rows = await executor.query(
+          'SELECT DISTINCT local_id FROM $_outbox '
+          'WHERE entity = ? AND local_id IN (${_marks(chunk.length)})',
+          [entity, ...chunk]);
+      for (final row in rows) {
+        found.add(row['local_id']!.toString());
+      }
+    });
+    return found;
+  }
+
+  @override
+  Future<Map<String, String>> localIdsForServer(
+      String entity, Iterable<String> serverIds) async {
+    final found = <String, String>{};
+    await _chunked<String>(serverIds.toSet(), (chunk) async {
+      final rows = await executor.query(
+          'SELECT server_id, local_id FROM $_idMap '
+          'WHERE entity = ? AND server_id IN (${_marks(chunk.length)})',
+          [entity, ...chunk]);
+      for (final row in rows) {
+        found.putIfAbsent(
+            row['server_id']!.toString(), () => row['local_id']!.toString());
+      }
+    });
+    return found;
+  }
+
+  @override
+  Future<Map<String, IdMapping>> mappingsForLocal(
+      String entity, Iterable<String> localIds) async {
+    final found = <String, IdMapping>{};
+    await _chunked<String>(localIds.toSet(), (chunk) async {
+      final rows = await executor.query(
+          'SELECT local_id, server_id FROM $_idMap '
+          'WHERE entity = ? AND local_id IN (${_marks(chunk.length)})',
+          [entity, ...chunk]);
+      for (final row in rows) {
+        final localId = row['local_id']!.toString();
+        found[localId] = IdMapping(
+          entity: entity,
+          localId: localId,
+          serverId: row['server_id']?.toString(),
+        );
+      }
+    });
+    return found;
+  }
+
+  @override
+  Future<void> putMappings(String entity, Map<String, String?> localToServer) {
+    if (localToServer.isEmpty) return Future.value();
+    return transaction(() => _chunked<MapEntry<String, String?>>(
+          localToServer.entries,
+          (chunk) => executor.execute(
+              'INSERT OR REPLACE INTO $_idMap (entity, local_id, server_id) '
+              'VALUES ${List.filled(chunk.length, '(?, ?, ?)').join(', ')}',
+              [
+                for (final entry in chunk) ...[entity, entry.key, entry.value],
+              ]),
+          reserved: 0,
+          perValue: 3,
+        ));
+  }
 }
