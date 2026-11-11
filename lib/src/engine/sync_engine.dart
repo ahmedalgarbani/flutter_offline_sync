@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
+import '../adapters/local_adapter.dart';
 import '../connectivity.dart';
 import '../core/conflict.dart';
 import '../core/entity_config.dart';
@@ -29,6 +31,13 @@ import 'sync_config.dart';
 ///
 /// Only one run (push and/or pull) happens at a time. Work requested while
 /// a run is in progress is merged into a single follow-up run.
+///
+/// The engine is built for large data sets. It never loads the whole outbox
+/// or id map: the outbox is walked a page at a time, pulled pages are looked
+/// up and written in batches, and operations can be sent in batches or in
+/// parallel (`SyncEntityConfig.pushBatchSize`). Memory use and the cost of
+/// each record stay the same whether the device holds a thousand rows or
+/// millions.
 class SyncEngine with WidgetsBindingObserver {
   SyncEngine({
     required this.store,
@@ -36,8 +45,11 @@ class SyncEngine with WidgetsBindingObserver {
     ConnectivitySource? connectivity,
     this.config = const SyncConfig(),
   })  : connectivity = connectivity ?? const AlwaysOnline(),
-        _entities = _index(entities) {
+        _entities = _index(entities),
+        _home = Zone.current {
     _pullOrder = _dependencyOrder(entities);
+    _outboxPage = entities.fold(config.outboxPageSize,
+        (size, cfg) => math.max(size, cfg.pushBatchSize));
   }
 
   final SyncStore store;
@@ -46,6 +58,17 @@ class SyncEngine with WidgetsBindingObserver {
 
   final Map<String, SyncEntityConfig> _entities;
   late final List<String> _pullOrder;
+
+  /// Operations read from the outbox at a time: at least one full batch.
+  late final int _outboxPage;
+
+  /// The zone [start] was called in (the one the engine was created in,
+  /// until then). The engine's timers, and so the syncs it starts by
+  /// itself, live there and never in the zone of whoever recorded a change:
+  /// that is often a database transaction, which is over by the time the
+  /// timer fires. A sync started from it would send its statements to a
+  /// transaction that no longer exists.
+  Zone _home;
 
   final ValueNotifier<SyncStatus> _status = ValueNotifier(const SyncStatus());
   final StreamController<SyncEvent> _events = StreamController.broadcast();
@@ -67,6 +90,30 @@ class SyncEngine with WidgetsBindingObserver {
 
   /// Whether `SyncConfig.onUnauthorized` was already called in this run.
   bool _authRetried = false;
+
+  /// Pushes in a row that the server answered "unavailable" in this run.
+  int _unavailableInRow = 0;
+
+  /// Times in a row a run was stopped because the server was unavailable,
+  /// and until when automatic runs leave it alone.
+  int _unavailableStops = 0;
+  DateTime? _serverBusyUntil;
+
+  /// A pull was put off because the server was unavailable.
+  bool _owesPull = false;
+
+  /// The run that was asked to stop (see [cancelSync]).
+  _RunRequest? _cancelled;
+
+  /// Ids of the operations this engine marked in flight and has not
+  /// settled yet.
+  final Set<String> _claimed = {};
+
+  /// Outbox size at the last count, and when it was made (see
+  /// [_refreshCounts]).
+  int _countedOperations = 0;
+  final Stopwatch _sinceCount = Stopwatch();
+  Timer? _countTimer;
 
   /// The run in progress, and the request it serves.
   Future<SyncRunResult>? _running;
@@ -129,6 +176,10 @@ class SyncEngine with WidgetsBindingObserver {
     return marker != null && identical(marker, _active);
   }
 
+  /// Whether the run in progress should stop at the next safe point.
+  bool get _stopRequested =>
+      _disposed || (_cancelled != null && identical(_cancelled, _active));
+
   // Lifecycle -----------------------------------------------------------------
 
   /// Prepares the store and installs the automatic triggers.
@@ -138,6 +189,7 @@ class SyncEngine with WidgetsBindingObserver {
   Future<void> start() async {
     if (_started || _disposed) return;
     _started = true;
+    _home = Zone.current;
     try {
       await _ensureInit();
     } catch (_) {
@@ -161,7 +213,8 @@ class SyncEngine with WidgetsBindingObserver {
 
     final interval = config.periodicInterval;
     if (interval != null) {
-      _periodic = Timer.periodic(interval, (_) => _schedule(pull: true));
+      _periodic =
+          _home.createPeriodicTimer(interval, (_) => _schedule(pull: true));
     }
 
     if (config.syncOnResume) {
@@ -184,14 +237,16 @@ class SyncEngine with WidgetsBindingObserver {
     }
   }
 
-  /// Stops triggers. A run in progress finishes normally; work queued
-  /// behind it is dropped.
+  /// Stops triggers. A run in progress stops after the operations or the
+  /// page it is working on (nothing is left half done); work queued behind
+  /// it is dropped.
   Future<void> dispose() async {
     if (_disposed) return;
     _disposed = true;
     _debounceTimer?.cancel();
     _periodic?.cancel();
     _retryTimer?.cancel();
+    _countTimer?.cancel();
     if (_observingLifecycle) {
       WidgetsBinding.instance.removeObserver(this);
       _observingLifecycle = false;
@@ -235,7 +290,7 @@ class SyncEngine with WidgetsBindingObserver {
       rethrow;
     }
     _initialized = true;
-    await _refreshCounts();
+    await _refreshCounts(force: true);
   }
 
   // Recording local writes ----------------------------------------------------
@@ -488,9 +543,30 @@ class SyncEngine with WidgetsBindingObserver {
     future.then((_) {
       _running = null;
       _active = null;
+      if (identical(_cancelled, request)) _cancelled = null;
       _startQueued();
     });
     return future;
+  }
+
+  /// Stops the run in progress after the operations or the page it is
+  /// working on, and drops the follow-up run queued behind it. Completes
+  /// when the run has stopped; its result reports
+  /// [SyncAbortReason.cancelled].
+  ///
+  /// Nothing is lost or left half done: operations already sent are
+  /// recorded, the others stay in the outbox, and an incremental pull
+  /// resumes from the last page it saved. Use it when the user leaves a
+  /// long first sync, or before signing out ([clear] does it for you).
+  Future<void> cancelSync() async {
+    final queued = _queued;
+    _queued = null;
+    queued?.completer
+        .complete(SyncRunResult()..abortedBy = SyncAbortReason.cancelled);
+    final running = _running;
+    if (running == null) return;
+    _cancelled = _active;
+    if (!_inRun) await running;
   }
 
   void _startQueued() {
@@ -529,7 +605,7 @@ class SyncEngine with WidgetsBindingObserver {
     if (maxDelay != null && waited + delay > maxDelay) {
       delay = waited >= maxDelay ? Duration.zero : maxDelay - waited;
     }
-    _debounceTimer = Timer(delay, () {
+    _debounceTimer = _home.createTimer(delay, () {
       _debounceWatch = null;
       final shouldPull = _debouncedPull && config.pullOnSync;
       _debouncedPull = false;
@@ -547,7 +623,9 @@ class SyncEngine with WidgetsBindingObserver {
     final stopwatch = Stopwatch()..start();
     var crashed = false;
     _authRetried = false;
+    _unavailableInRow = 0;
     _emit(const SyncEvent(SyncEventType.runStarted));
+    _setStatus(_status.value.copyWith(runPushed: 0, runPulled: 0));
     try {
       await _ensureInit();
       final gate = config.canSync;
@@ -555,9 +633,14 @@ class SyncEngine with WidgetsBindingObserver {
         result.abortedBy = SyncAbortReason.paused;
       } else if (!connectivity.isOnline) {
         result.abortedBy = SyncAbortReason.offline;
+      } else if (request.push && !request.ignoreBackoff && _serverIsBusy) {
+        // The server asked to be left alone for a while.
+        result.abortedBy = SyncAbortReason.serverUnavailable;
       } else {
         if (request.push) {
-          if (request.ignoreBackoff) await _endBackoff(request.only);
+          if (request.ignoreBackoff) {
+            await store.clearBackoff(_now(), entities: request.only);
+          }
           await _push(result, request.only);
         }
         if (result.abortedBy == null && request.pull) {
@@ -569,8 +652,14 @@ class SyncEngine with WidgetsBindingObserver {
       result.errors.add(e.toString());
       _log(SyncLogLevel.error, 'Sync run failed', e, st);
     }
+    await _releaseClaimed();
     stopwatch.stop();
     result.duration = stopwatch.elapsed;
+
+    final serverUnavailable =
+        result.abortedBy == SyncAbortReason.serverUnavailable;
+    // A pull the pause kept from happening is made when the pause ends.
+    if (request.pull) _owesPull = serverUnavailable;
 
     final nextRetry = await _scheduleRetry();
     if (!_disposed) {
@@ -578,8 +667,12 @@ class SyncEngine with WidgetsBindingObserver {
         SyncAbortReason.offline => SyncPhase.offline,
         SyncAbortReason.unauthorized => SyncPhase.authRequired,
         SyncAbortReason.paused => SyncPhase.paused,
-        null => SyncPhase.idle,
+        SyncAbortReason.serverUnavailable => SyncPhase.serverUnavailable,
+        SyncAbortReason.cancelled || null => SyncPhase.idle,
       };
+      // A run the pause stopped before it began has no error of its own:
+      // the one that started the pause still explains the state.
+      final keepError = serverUnavailable && result.errors.isEmpty;
       _setStatus(_status.value.copyWith(
         phase: phase,
         isOnline: result.abortedBy == SyncAbortReason.offline
@@ -588,213 +681,468 @@ class SyncEngine with WidgetsBindingObserver {
         clearCurrentEntity: true,
         lastSyncedAt: result.completed && !crashed ? _now() : null,
         lastError: result.errors.isEmpty ? null : result.errors.last,
-        clearLastError: result.errors.isEmpty,
+        clearLastError: result.errors.isEmpty && !keepError,
         nextRetryAt: nextRetry,
         clearNextRetryAt: nextRetry == null,
+        runPushed: result.pushed,
+        runPulled: result.pulled,
       ));
-      await _refreshCounts();
+      await _refreshCounts(force: true);
     }
     _emit(SyncEvent(SyncEventType.runFinished, message: result.toString()));
     _log(SyncLogLevel.info, 'Sync run finished: $result');
     return result;
   }
 
-  /// Arms a timer for the earliest operation waiting out a backoff delay,
-  /// so it is retried without waiting for another trigger. Returns its time.
+  bool get _serverIsBusy {
+    final until = _serverBusyUntil;
+    return until != null && until.isAfter(_now());
+  }
+
+  /// Arms a timer for the earliest operation waiting out a backoff delay
+  /// (or for the end of the pause an unavailable server caused), so it is
+  /// retried without waiting for another trigger. Returns that time.
   Future<DateTime?> _scheduleRetry() async {
     _retryTimer?.cancel();
     _retryTimer = null;
     if (_disposed) return null;
-    final List<SyncOperation> pending;
+    DateTime? earliest;
     try {
-      pending = await store.operations(statuses: {SyncOpStatus.pending});
+      earliest = await store.nextAttemptAfter(_now());
     } catch (e, st) {
       _log(SyncLogLevel.warning, 'Could not read the outbox', e, st);
       return null;
     }
     final now = _now();
-    DateTime? earliest;
-    for (final op in pending) {
-      final next = op.nextAttemptAt;
-      // Operations whose time has passed but were not pushed are blocked by
-      // something else (a parent, a failed operation of the same record).
-      if (next != null &&
-          next.isAfter(now) &&
-          (earliest == null || next.isBefore(earliest))) {
-        earliest = next;
-      }
-    }
+    // Nothing is sent before the pause ends, and operations that were not
+    // tried yet are due as soon as it does.
+    final busyUntil = _serverBusyUntil;
+    if (busyUntil != null && busyUntil.isAfter(now)) earliest = busyUntil;
     if (earliest == null || _disposed) return null;
     if (_started) {
-      _retryTimer = Timer(earliest.difference(now),
-          () => _schedule(pull: false, immediate: true));
+      _retryTimer = _home.createTimer(earliest.difference(now),
+          () => _schedule(pull: _owesPull, immediate: true));
     }
     return earliest;
   }
 
   // Push ----------------------------------------------------------------------
 
-  /// Makes the operations waiting out a backoff delay due now. Their
-  /// attempt counts are kept, so the retry policy still applies.
-  Future<void> _endBackoff(Set<String>? only) => store.transaction(() async {
-        final now = _now();
-        final pending =
-            await store.operations(statuses: {SyncOpStatus.pending});
-        for (final op in pending) {
-          final next = op.nextAttemptAt;
-          if (next == null || !next.isAfter(now)) continue;
-          if (only != null && !only.contains(op.entity)) continue;
-          await store.updateOperation(op.copyWith(clearNextAttemptAt: true));
-        }
-      });
-
   Future<void> _push(SyncRunResult result, Set<String>? only) async {
     for (var pass = 0; pass < config.maxPushPasses; pass++) {
       final progress = await _pushPass(result, only);
       if (result.abortedBy != null || !progress) break;
     }
-    final left = await store.operations(statuses: {SyncOpStatus.pending});
-    result.waiting =
-        left.where((o) => only == null || only.contains(o.entity)).length;
+    result.waiting = await store.countOperations(
+        statuses: const {SyncOpStatus.pending}, entities: only);
   }
 
-  /// One ordered walk over the outbox. Returns true if anything changed
-  /// that could unblock other operations.
+  /// One ordered walk over the operations that are due, a page of the
+  /// outbox at a time. Returns true if anything changed that could unblock
+  /// other operations.
   Future<bool> _pushPass(SyncRunResult result, Set<String>? only) async {
-    final ops = await store
-        .operations(statuses: {SyncOpStatus.pending, SyncOpStatus.failed});
-    final blocked = <String>{
-      for (final op in ops)
-        if (op.isFailed) _recordKey(op.entity, op.localId),
-    };
     var progress = false;
-
-    for (final listed in ops) {
-      if (!listed.isPending) continue;
-      if (only != null && !only.contains(listed.entity)) continue;
-      final key = _recordKey(listed.entity, listed.localId);
-      if (blocked.contains(key)) continue;
-      final next = listed.nextAttemptAt;
-      if (next != null && next.isAfter(_now())) {
-        blocked.add(key);
-        continue;
+    var afterSeq = 0;
+    // What is learnt in this pass about the records that others wait for.
+    // It may go stale during the pass, but only by something being pushed,
+    // and then another pass follows.
+    final waitedFor = _Mappings(store);
+    while (result.abortedBy == null) {
+      final page = await store.operationsPage(
+        statuses: const {SyncOpStatus.pending},
+        entities: only,
+        dueAt: _now(),
+        afterSeq: afterSeq,
+        limit: _outboxPage,
+      );
+      var index = 0;
+      while (index < page.length && result.abortedBy == null) {
+        if (_stopRequested) {
+          result.abortedBy = SyncAbortReason.cancelled;
+          break;
+        }
+        final first = page[index++];
+        final cfg = _entities[first.entity];
+        if (cfg == null) {
+          await _markFailed(first, 'Unknown entity "${first.entity}"', result);
+          continue;
+        }
+        // Operations that follow each other, of one entity and of different
+        // records, are sent together (one at a time by default).
+        final chunk = <SyncOperation>[first];
+        final records = <String>{first.localId};
+        while (index < page.length &&
+            chunk.length < cfg.pushBatchSize &&
+            page[index].entity == cfg.name &&
+            records.add(page[index].localId)) {
+          chunk.add(page[index++]);
+        }
+        if (await _pushChunk(chunk, cfg, result, waitedFor)) progress = true;
+        await _refreshCounts();
       }
-      final cfg = _entities[listed.entity];
-      if (cfg == null) {
-        await _markFailed(listed, 'Unknown entity "${listed.entity}"', result);
-        blocked.add(key);
-        continue;
-      }
-
-      final op = await _claim(listed.id);
-      if (op == null) continue;
-
-      _setCurrent(SyncPhase.pushing, op.entity);
-      switch (await _pushOne(op, cfg, result)) {
-        case _Step.pushed:
-          progress = true;
-        case _Step.held:
-          blocked.add(key);
-        case _Step.resolved:
-          blocked.add(key);
-          progress = true;
-      }
-      await _refreshCounts();
-      if (result.abortedBy != null) break;
+      if (page.length < _outboxPage) break;
+      afterSeq = page.last.seq!;
     }
     return progress;
   }
 
-  /// Re-reads and claims an operation: the app may have merged new data
-  /// into it since the list was loaded.
-  Future<SyncOperation?> _claim(String id) => store.transaction(() async {
-        final fresh = await store.operationById(id);
-        if (fresh == null || !fresh.isPending) return null;
-        final claimed = fresh.copyWith(status: SyncOpStatus.inFlight);
-        await store.updateOperation(claimed);
+  /// Claims, prepares, sends and settles [chunk]: operations of [cfg], each
+  /// of another record. Returns true if anything changed that could unblock
+  /// other operations. Leaves nothing claimed.
+  Future<bool> _pushChunk(
+    List<SyncOperation> chunk,
+    SyncEntityConfig cfg,
+    SyncRunResult result,
+    _Mappings waitedFor,
+  ) async {
+    final ready = <SyncOperation>[];
+    for (final op in chunk) {
+      if (!await _stillWaiting(op, cfg, waitedFor)) ready.add(op);
+    }
+    if (ready.isEmpty) return false;
+    final claimed = await _claim(cfg.name, ready);
+    if (claimed.isEmpty) return false;
+    _setCurrent(SyncPhase.pushing, cfg.name);
+
+    final mappings = _Mappings(store);
+    if (claimed.length > 1) await _preloadMappings(mappings, cfg, claimed);
+
+    var progress = false;
+    final group = <_Ready>[];
+    for (var i = 0; i < claimed.length; i++) {
+      final op = claimed[i];
+      var prepared = await _prepareOrBackOff(op, cfg, mappings, result);
+      if (prepared is _Wait && group.isNotEmpty) {
+        // It may be waiting for an operation of this very group (a record
+        // that references another one of its own entity): send the group,
+        // then look again.
+        if (await _sendGroup(List.of(group), cfg, result)) progress = true;
+        group.clear();
+        mappings.clear();
+        if (result.abortedBy != null) {
+          await _releaseAll(claimed.sublist(i));
+          return progress;
+        }
+        prepared = await _prepareOrBackOff(op, cfg, mappings, result);
+      }
+      switch (prepared) {
+        case _Ready():
+          group.add(prepared);
+        case _Wait(:final reason):
+          await _release(op, reason);
+        case _Reject(:final reason):
+          await _markFailed(op, reason, result);
+        case _Resolved() || null:
+          // Preparing failed and the operation was put back with a delay.
+          break;
+      }
+    }
+    if (group.isNotEmpty && await _sendGroup(group, cfg, result)) {
+      progress = true;
+    }
+    return progress;
+  }
+
+  /// Whether [op], which waited for another record the last time it was
+  /// looked at, still waits for the same reason.
+  ///
+  /// Such an operation is left as it is. Claiming it and putting it back
+  /// writes to the outbox twice, and thousands of bills waiting for a
+  /// customer the server rejected would pay that on every sync until the
+  /// customer is fixed. Looking costs a few reads, shared by the operations
+  /// that wait for the same record.
+  Future<bool> _stillWaiting(
+      SyncOperation op, SyncEntityConfig cfg, _Mappings waitedFor) async {
+    final reason = op.lastError;
+    if (reason == null || !reason.startsWith(_waitPrefix)) return false;
+    try {
+      final prepared = await _prepare(op, cfg, waitedFor);
+      return prepared is _Wait && prepared.reason == reason;
+    } catch (_) {
+      // Let the normal path deal with (and report) the failure.
+      return false;
+    }
+  }
+
+  /// Every reason an operation waits for another record starts like this.
+  static const _waitPrefix = 'Waiting for ';
+
+  /// Re-reads and claims operations of [entity], each of another record:
+  /// the app may have merged new data into them, or removed them, since the
+  /// page was loaded.
+  ///
+  /// An operation is left alone while an earlier one of its record is still
+  /// in the outbox (failed, waiting for something or backing off): the
+  /// changes of a record reach the server in the order they were made.
+  Future<List<SyncOperation>> _claim(
+          String entity, List<SyncOperation> listed) =>
+      store.transaction(() async {
+        final fresh = listed.length == 1
+            ? await store.operationsFor(entity, listed.single.localId)
+            : await store.operationsForRecords(
+                entity, [for (final op in listed) op.localId]);
+        final firstOf = <String, SyncOperation>{};
+        for (final op in fresh) {
+          firstOf.putIfAbsent(op.localId, () => op);
+        }
+        final now = _now();
+        final claimed = <SyncOperation>[];
+        for (final op in listed) {
+          final first = firstOf[op.localId];
+          if (first == null || first.id != op.id || !first.isPending) continue;
+          final next = first.nextAttemptAt;
+          if (next != null && next.isAfter(now)) continue;
+          claimed.add(first.copyWith(status: SyncOpStatus.inFlight));
+        }
+        if (claimed.isNotEmpty) {
+          final ids = [for (final op in claimed) op.id];
+          await store.markOperations(ids, SyncOpStatus.inFlight);
+          _claimed.addAll(ids);
+        }
         return claimed;
       });
 
-  /// Sends one claimed operation. Never leaves it in flight unless the store
-  /// itself fails.
-  Future<_Step> _pushOne(
+  /// Reads the id mappings a group of operations needs in one go: their own
+  /// and those of the records they reference.
+  Future<void> _preloadMappings(
+    _Mappings mappings,
+    SyncEntityConfig cfg,
+    List<SyncOperation> operations,
+  ) async {
+    await mappings.load(cfg.name, [for (final op in operations) op.localId]);
+    for (final reference in cfg.references) {
+      final ids = <String>{};
+      for (final op in operations) {
+        for (final value in reference.read(op.payload)) {
+          final id = SyncIds.normalize(value);
+          if (id != null) ids.add(id);
+        }
+      }
+      await mappings.load(reference.target, ids);
+    }
+  }
+
+  /// [_prepare], or null when it threw and the operation was put back with
+  /// a delay.
+  Future<_Prepared?> _prepareOrBackOff(
     SyncOperation op,
     SyncEntityConfig cfg,
+    _Mappings mappings,
     SyncRunResult result,
   ) async {
-    final PushRequest request;
     try {
-      switch (await _prepare(op, cfg)) {
-        case _Ready(request: final ready):
-          request = ready;
-        case _Wait(:final reason):
-          await _release(op, reason);
-          return _Step.held;
-        case _Reject(:final reason):
-          await _markFailed(op, reason, result);
-          return _Step.held;
-        case _Resolved():
-          throw StateError('unreachable');
-      }
+      return await _prepare(op, cfg, mappings);
     } catch (e, st) {
       // A local failure, e.g. buildPushPayload threw: retry with backoff.
       _log(SyncLogLevel.warning, 'Preparing ${op.entity}/${op.localId} failed',
           e, st);
       await _backoff(op, e, result);
-      return _Step.held;
-    }
-
-    PushOutcome outcome;
-    try {
-      outcome = await cfg.remote.push(request);
-    } catch (e, st) {
-      outcome = _classify(e);
-      _log(
-          SyncLogLevel.warning, 'Push ${op.entity}/${op.localId} threw', e, st);
-    }
-
-    switch (outcome) {
-      case PushSuccess():
-        return await _onPushSuccess(op, cfg, request, outcome, result)
-            ? _Step.pushed
-            : _Step.held;
-      case PushNetworkError(:final error):
-        await _release(op, error.toString());
-        result.abortedBy = SyncAbortReason.offline;
-        return _Step.held;
-      case PushUnauthorized(:final error):
-        await _release(op, (error ?? 'Unauthorized').toString());
-        // A refreshed session retries the operation in the next pass.
-        if (await _refreshAuth()) return _Step.resolved;
-        result.abortedBy = SyncAbortReason.unauthorized;
-        return _Step.held;
-      case PushRetry(:final error, :final retryAfter):
-        await _backoff(op, error, result, retryAfter: retryAfter);
-        return _Step.held;
-      case PushRejected(:final error):
-        await _markFailed(op, error, result);
-        return _Step.held;
-      case PushConflict():
-        try {
-          await _onPushConflict(op, cfg, request, outcome, result);
-        } catch (e, st) {
-          _log(
-              SyncLogLevel.warning,
-              'Resolving the conflict on ${op.entity}/${op.localId} failed',
-              e,
-              st);
-          await _backoff(op, e, result);
-          return _Step.held;
-        }
-        return _Step.resolved;
+      return null;
     }
   }
 
+  /// Sends the prepared operations of [group] and settles each of them.
+  /// Returns true if anything changed that could unblock other operations.
+  /// Never leaves an operation in flight unless the store itself fails.
+  Future<bool> _sendGroup(
+    List<_Ready> group,
+    SyncEntityConfig cfg,
+    SyncRunResult result,
+  ) async {
+    final outcomes = await _send(cfg, group);
+    var progress = false;
+
+    // Accepted operations first, recorded together.
+    final accepted = <_Accepted>[];
+    for (var i = 0; i < group.length; i++) {
+      final outcome = outcomes[i];
+      if (outcome is! PushSuccess) continue;
+      final request = group[i].request;
+      var serverId = request.serverId;
+      if (request.type == SyncOpType.create) {
+        serverId = SyncIds.normalize(outcome.serverId) ??
+            (outcome.record == null
+                ? null
+                : SyncIds.normalize(cfg.serverIdOf(outcome.record!)));
+        if (serverId == null) {
+          // Retrying would create a duplicate, so stop and surface it.
+          await _markFailed(
+              group[i].op,
+              'The server accepted the create but returned no id. '
+              'Return PushOutcome.success(serverId: ...) from the adapter.',
+              result);
+          continue;
+        }
+      }
+      accepted.add(_Accepted(group[i].op, request, outcome, serverId));
+    }
+    if (accepted.isNotEmpty) {
+      await _recordAccepted(cfg, accepted, result);
+      progress = true;
+      // The server is answering.
+      _unavailableInRow = 0;
+      _unavailableStops = 0;
+      _serverBusyUntil = null;
+    }
+
+    var authRefreshed = false;
+    for (var i = 0; i < group.length; i++) {
+      final op = group[i].op;
+      final outcome = outcomes[i];
+      switch (outcome) {
+        case PushSuccess():
+          break;
+        case PushNetworkError(:final error):
+          await _release(op, error.toString());
+          result.abortedBy ??= SyncAbortReason.offline;
+        case PushUnauthorized(:final error):
+          await _release(op, (error ?? 'Unauthorized').toString());
+          // A refreshed session retries the operation in the next pass.
+          if (authRefreshed || await _refreshAuth()) {
+            authRefreshed = true;
+            progress = true;
+          } else {
+            result.abortedBy ??= SyncAbortReason.unauthorized;
+          }
+        case PushRetry(:final error, :final retryAfter):
+          await _backoff(op, error, result, retryAfter: retryAfter);
+          if (outcome.serverUnavailable) {
+            _onServerUnavailable(error, retryAfter, result);
+          } else {
+            _unavailableInRow = 0;
+          }
+        case PushRejected(:final error):
+          _unavailableInRow = 0;
+          await _markFailed(op, error, result);
+        case PushConflict():
+          _unavailableInRow = 0;
+          try {
+            await _onPushConflict(op, cfg, group[i].request, outcome, result);
+            progress = true;
+          } catch (e, st) {
+            _log(
+                SyncLogLevel.warning,
+                'Resolving the conflict on ${op.entity}/${op.localId} failed',
+                e,
+                st);
+            await _backoff(op, e, result);
+          }
+      }
+    }
+    if (accepted.isNotEmpty) {
+      _setStatus(_status.value.copyWith(runPushed: result.pushed));
+    }
+    return progress;
+  }
+
+  /// Sends [group] and returns one outcome per operation, in order. Thrown
+  /// errors become outcomes through `SyncConfig.classifyError`.
+  Future<List<PushOutcome>> _send(
+      SyncEntityConfig cfg, List<_Ready> group) async {
+    Future<PushOutcome> one(PushRequest request) async {
+      try {
+        return await cfg.remote.push(request);
+      } catch (e, st) {
+        _log(SyncLogLevel.warning,
+            'Push ${request.entity}/${request.localId} threw', e, st);
+        return _classify(e);
+      }
+    }
+
+    final requests = [for (final ready in group) ready.request];
+    if (cfg.pushBatchSize <= 1) return [await one(requests.single)];
+
+    final List<PushOutcome>? outcomes;
+    try {
+      outcomes = await cfg.remote.pushBatch(requests);
+    } catch (e, st) {
+      _log(SyncLogLevel.warning,
+          'Pushing ${requests.length} ${cfg.name} operations threw', e, st);
+      return List.filled(requests.length, _classify(e));
+    }
+    // No batch endpoint: send the operations side by side.
+    if (outcomes == null) return Future.wait(requests.map(one));
+    if (outcomes.length != requests.length) {
+      final error = StateError(
+          '${cfg.name}: pushBatch returned ${outcomes.length} outcomes for '
+          '${requests.length} requests; it must return one per request, in '
+          'the same order');
+      _log(SyncLogLevel.error, error.message);
+      return List.filled(requests.length, PushOutcome.retry(error));
+    }
+    return outcomes;
+  }
+
+  /// Counts a push the server answered "unavailable" (overloaded, down for
+  /// maintenance, rate limited). After `SyncConfig.serverUnavailableThreshold`
+  /// of them in a row the run stops, as it does when the network is gone:
+  /// sending the rest of the outbox would only add load to a server that is
+  /// struggling, and use up the attempts of every operation.
+  ///
+  /// Automatic runs then stay away for the retry policy's delay (or the
+  /// server's `Retry-After`), which grows each time the server is still
+  /// unavailable. After a pause one such answer is enough to stop again.
+  void _onServerUnavailable(
+      Object error, Duration? retryAfter, SyncRunResult result) {
+    _unavailableInRow++;
+    final threshold =
+        _unavailableStops > 0 ? 1 : config.serverUnavailableThreshold;
+    if (threshold == null ||
+        _unavailableInRow < threshold ||
+        result.abortedBy != null) {
+      return;
+    }
+    _unavailableStops++;
+    var delay = config.retryPolicy.delayFor(_unavailableStops);
+    if (retryAfter != null && retryAfter > delay) delay = retryAfter;
+    _serverBusyUntil = _now().add(delay);
+    result.abortedBy = SyncAbortReason.serverUnavailable;
+    final message = 'The server is unavailable ($error); '
+        'trying again in ${_describeDelay(delay)}';
+    result.errors.add(message);
+    _log(SyncLogLevel.warning, message);
+  }
+
+  static String _describeDelay(Duration delay) => delay.inSeconds < 120
+      ? '${math.max(1, delay.inSeconds)} s'
+      : '${delay.inMinutes} min';
+
   /// Puts a claimed operation back in the queue without counting an
   /// attempt.
-  Future<void> _release(SyncOperation op, String reason) =>
-      store.updateOperation(
-          op.copyWith(status: SyncOpStatus.pending, lastError: reason));
+  Future<void> _release(SyncOperation op, String reason) {
+    _claimed.remove(op.id);
+    return store.updateOperation(
+        op.copyWith(status: SyncOpStatus.pending, lastError: reason));
+  }
+
+  /// Puts claimed operations nothing was done with back in the queue.
+  Future<void> _releaseAll(List<SyncOperation> operations) {
+    final ids = [for (final op in operations) op.id];
+    _claimed.removeAll(ids);
+    return store.markOperations(ids, SyncOpStatus.pending);
+  }
+
+  /// Puts back whatever a run that failed midway (a store error) left
+  /// claimed, so those operations do not wait for the next app start.
+  Future<void> _releaseClaimed() async {
+    if (_claimed.isEmpty) return;
+    final ids = _claimed.toList();
+    _claimed.clear();
+    try {
+      await store.transaction(() async {
+        // Only those still in flight: the others were settled.
+        final stuck = <String>[];
+        for (final id in ids) {
+          final op = await store.operationById(id);
+          if (op != null && op.status == SyncOpStatus.inFlight) stuck.add(id);
+        }
+        await store.markOperations(stuck, SyncOpStatus.pending);
+      });
+    } catch (e, st) {
+      _log(SyncLogLevel.warning,
+          'Could not put ${ids.length} claimed operation(s) back', e, st);
+    }
+  }
 
   /// Gives the app one chance per run to refresh expired credentials.
   Future<bool> _refreshAuth() async {
@@ -818,9 +1166,10 @@ class SyncEngine with WidgetsBindingObserver {
     }
   }
 
-  Future<_Prepared> _prepare(SyncOperation op, SyncEntityConfig cfg) async {
+  Future<_Prepared> _prepare(
+      SyncOperation op, SyncEntityConfig cfg, _Mappings mappings) async {
     var type = op.type;
-    final serverId = await _serverIdFor(cfg, op.localId);
+    final serverId = await _serverIdFor(cfg, op.localId, mappings);
     if (type != SyncOpType.create && serverId == null) {
       final waitReason = await _pendingCreatorOf(op.entity, op.localId);
       if (waitReason != null) return _Wait(waitReason);
@@ -839,7 +1188,7 @@ class SyncEngine with WidgetsBindingObserver {
         final localRef = SyncIds.normalize(value);
         if (localRef == null || resolved.containsKey(localRef)) continue;
         final resolution = await _resolveOutbound(
-            reference.target, localRef, cfg.unknownReferencePolicy);
+            reference.target, localRef, cfg.unknownReferencePolicy, mappings);
         switch (resolution) {
           case _Resolved(:final serverId):
             resolved[localRef] = serverId;
@@ -860,27 +1209,27 @@ class SyncEngine with WidgetsBindingObserver {
     }
 
     final sendOp = type == op.type ? op : op.copyWith(type: type);
-    return _Ready(PushRequest(
-      operation: sendOp,
-      payload: payload,
-      serverId: serverId,
-    ));
+    return _Ready(
+      op,
+      PushRequest(operation: sendOp, payload: payload, serverId: serverId),
+    );
   }
 
   Future<_Prepared> _resolveOutbound(
     String target,
     String localRef,
     UnknownReferencePolicy policy,
+    _Mappings mappings,
   ) async {
-    final mapping = await store.mappingForLocal(target, localRef);
+    final mapping = await mappings.forLocal(target, localRef);
     if (mapping?.serverId != null) return _Resolved(mapping!.serverId);
 
-    final targetOps = await store.operationsFor(target, localRef);
-    if (targetOps.any((o) => o.isFailed)) {
-      return _Wait('Waiting for $target/$localRef, whose sync failed');
+    final queued = await mappings.queueOf(target, localRef);
+    if (queued.failed) {
+      return _Wait('$_waitPrefix$target/$localRef, whose sync failed');
     }
-    if (targetOps.any((o) => o.type == SyncOpType.create)) {
-      return _Wait('Waiting for $target/$localRef to be pushed');
+    if (queued.creating) {
+      return _Wait('$_waitPrefix$target/$localRef to be pushed');
     }
     if (mapping != null) {
       final waitReason = await _pendingCreatorOf(target, localRef);
@@ -894,6 +1243,7 @@ class SyncEngine with WidgetsBindingObserver {
         SyncIds.normalize(await targetCfg?.local.findServerId(localRef));
     if (legacy != null) {
       await store.putMapping(target, localRef, legacy);
+      mappings.put(target, localRef, legacy);
       return _Resolved(legacy);
     }
     if (policy == UnknownReferencePolicy.reject) {
@@ -915,44 +1265,69 @@ class SyncEngine with WidgetsBindingObserver {
       await store.setMeta(key, null);
       return null;
     }
-    return 'Waiting for ${parts[0]}/${parts[1]}, which creates '
+    return '$_waitPrefix${parts[0]}/${parts[1]}, which creates '
         '$entity/$localId';
   }
 
-  Future<bool> _onPushSuccess(
-    SyncOperation op,
+  /// Records what the server accepted: the new ids, the app's own
+  /// bookkeeping, and the removal from the outbox.
+  ///
+  /// A group is recorded in one transaction, which is what makes a batch
+  /// cheap. If the app's bookkeeping fails for one record, that undoes the
+  /// others too, so they are then recorded one by one.
+  Future<void> _recordAccepted(
     SyncEntityConfig cfg,
-    PushRequest request,
-    PushSuccess outcome,
+    List<_Accepted> accepted,
     SyncRunResult result,
   ) async {
-    String? serverId = request.serverId;
-    final isCreate = request.type == SyncOpType.create;
-    if (isCreate) {
-      serverId = SyncIds.normalize(outcome.serverId) ??
-          (outcome.record == null
-              ? null
-              : SyncIds.normalize(cfg.serverIdOf(outcome.record!)));
-      if (serverId == null) {
-        // Retrying would create a duplicate, so stop and surface it.
-        await _markFailed(
-            op,
-            'The server accepted the create but returned no id. '
-            'Return PushOutcome.success(serverId: ...) from the adapter.',
-            result);
-        return false;
+    var recorded = false;
+    if (accepted.length > 1) {
+      try {
+        await store.transaction(() async {
+          await store.putMappings(cfg.name, {
+            for (final a in accepted)
+              if (a.isCreate) a.op.localId: a.serverId,
+          });
+          await store.deleteOperations([for (final a in accepted) a.op.id]);
+          for (final a in accepted) {
+            if (a.isCreate) {
+              await cfg.local.onServerIdAssigned(a.op.localId, a.serverId!,
+                  serverRecord: a.outcome.record);
+            }
+            await cfg.local.onPushed(a.op, serverId: a.serverId);
+          }
+        });
+        recorded = true;
+      } catch (e, st) {
+        _log(
+            SyncLogLevel.warning,
+            'Recording ${accepted.length} pushed ${cfg.name} operations '
+            'together failed; recording them one by one',
+            e,
+            st);
       }
     }
+    for (final a in accepted) {
+      if (!recorded) await _recordOneAccepted(cfg, a, result);
+      _claimed.remove(a.op.id);
+      result.pushed++;
+      _emit(SyncEvent(SyncEventType.operationPushed,
+          entity: a.op.entity, localId: a.op.localId, message: a.serverId));
+    }
+  }
 
+  Future<void> _recordOneAccepted(
+      SyncEntityConfig cfg, _Accepted a, SyncRunResult result) async {
+    final op = a.op;
     try {
       await store.transaction(() async {
-        if (isCreate) {
-          await store.putMapping(op.entity, op.localId, serverId);
-          await cfg.local.onServerIdAssigned(op.localId, serverId!,
-              serverRecord: outcome.record);
+        if (a.isCreate) {
+          await store.putMapping(op.entity, op.localId, a.serverId);
+          await cfg.local.onServerIdAssigned(op.localId, a.serverId!,
+              serverRecord: a.outcome.record);
         }
         await store.deleteOperation(op.id);
-        await cfg.local.onPushed(op, serverId: serverId);
+        await cfg.local.onPushed(op, serverId: a.serverId);
       });
     } catch (e, st) {
       // The server has the change: never send it again, even though the
@@ -961,15 +1336,12 @@ class SyncEngine with WidgetsBindingObserver {
           'Recording the push of ${op.entity}/${op.localId} failed', e, st);
       result.errors.add('${op.entity}/${op.localId}: $e');
       await store.transaction(() async {
-        if (isCreate) await store.putMapping(op.entity, op.localId, serverId);
+        if (a.isCreate) {
+          await store.putMapping(op.entity, op.localId, a.serverId);
+        }
         await store.deleteOperation(op.id);
       });
     }
-
-    result.pushed++;
-    _emit(SyncEvent(SyncEventType.operationPushed,
-        entity: op.entity, localId: op.localId, message: serverId));
-    return true;
   }
 
   Future<void> _onPushConflict(
@@ -1038,6 +1410,7 @@ class SyncEngine with WidgetsBindingObserver {
             await store.putMapping(op.entity, op.localId, serverId);
           }
         });
+        _claimed.remove(op.id);
     }
   }
 
@@ -1065,6 +1438,7 @@ class SyncEngine with WidgetsBindingObserver {
     if (!immediate && retryAfter != null && retryAfter > delay) {
       delay = retryAfter;
     }
+    _claimed.remove(op.id);
     await store.updateOperation(op.copyWith(
       status: SyncOpStatus.pending,
       attempts: attempts,
@@ -1081,6 +1455,7 @@ class SyncEngine with WidgetsBindingObserver {
       lastError: error.toString(),
       clearNextAttemptAt: true,
     );
+    _claimed.remove(op.id);
     await store.updateOperation(failed);
     result.failed++;
     result.errors.add('${op.entity}/${op.localId}: $error');
@@ -1105,6 +1480,10 @@ class SyncEngine with WidgetsBindingObserver {
       if (only != null && !only.contains(name)) continue;
       final cfg = _entities[name]!;
       if (cfg.pullMode == PullMode.none) continue;
+      if (_stopRequested) {
+        result.abortedBy = SyncAbortReason.cancelled;
+        return;
+      }
       _setCurrent(SyncPhase.pulling, name);
       await _pullEntity(cfg, result);
       if (result.abortedBy != null) return;
@@ -1115,9 +1494,15 @@ class SyncEngine with WidgetsBindingObserver {
     final incremental = cfg.pullMode == PullMode.incremental;
     String? cursor =
         incremental ? await store.getMeta(_cursorKey(cfg.name)) : null;
-    final seen = <String>{};
+    // Only a full refresh reports the ids it saw; an incremental pull of
+    // millions of records must not keep them all in memory.
+    final seen = incremental ? null : <String>{};
 
     while (true) {
+      if (_stopRequested) {
+        result.abortedBy = SyncAbortReason.cancelled;
+        return;
+      }
       final PullPage page;
       try {
         page = await cfg.remote.pull(PullRequest(
@@ -1145,6 +1530,7 @@ class SyncEngine with WidgetsBindingObserver {
         _log(SyncLogLevel.error, 'Applying pulled ${cfg.name} failed', e, st);
         return;
       }
+      _setStatus(_status.value.copyWith(runPulled: result.pulled));
 
       if (!page.hasMore) break;
       if (page.nextCursor == null || page.nextCursor == cursor) {
@@ -1158,7 +1544,7 @@ class SyncEngine with WidgetsBindingObserver {
       await Future<void>.delayed(Duration.zero);
     }
 
-    if (!incremental) {
+    if (seen != null) {
       try {
         await cfg.local.onFullRefreshComplete(seen);
       } catch (e, st) {
@@ -1170,160 +1556,256 @@ class SyncEngine with WidgetsBindingObserver {
   }
 
   /// Applies one pulled page; returns the number of records written.
+  ///
+  /// The page is handled as a whole: one lookup tells which of its records
+  /// are already on the device, one per referenced entity converts the
+  /// references, one finds the records with unpushed changes, and the rows
+  /// are handed to `LocalAdapter.applyRemoteBatch` together. The number of
+  /// database statements depends on the number of pages, not of records.
+  /// Records are still applied in the order the server sent them.
   Future<int> _applyPage(
     SyncEntityConfig cfg,
     PullPage page,
-    Set<String> seen, {
+    Set<String>? seen, {
     required bool saveCursor,
   }) async {
-    var applied = 0;
-    final withOps = await _recordsWithOperations(cfg.name);
+    final name = cfg.name;
+    final serverIds = <String>[];
+    final records = <Map<String, dynamic>>[];
     for (final record in page.records) {
       final serverId = SyncIds.normalize(cfg.serverIdOf(record));
       if (serverId == null) continue;
-      seen.add(serverId);
-      if (cfg.isDeletedOf?.call(record) ?? false) {
-        await _applyServerDelete(cfg, serverId);
-      } else if (await _applyServerRecord(cfg, serverId, record, withOps)) {
-        applied++;
+      serverIds.add(serverId);
+      records.add(record);
+      seen?.add(serverId);
+    }
+    final deleted = <String>[
+      for (final raw in page.deletedServerIds)
+        if (SyncIds.normalize(raw) case final serverId?) serverId,
+    ];
+
+    // Local ids by entity and server id; null when the device has none.
+    final local = <String, Map<String, String?>>{};
+    final known =
+        local[name] = await _localIdsFor(cfg, name, [...serverIds, ...deleted]);
+    await _loadReferences(cfg, records, local);
+
+    // Records this device created that still wait for their server id: the
+    // server may be sending one of them back (see [SyncEntityConfig.clientIdOf]).
+    final clientIdOf = cfg.clientIdOf;
+    final unconfirmed = <String>{};
+    if (clientIdOf != null) {
+      final candidates = <String>{};
+      for (var i = 0; i < records.length; i++) {
+        if (known[serverIds[i]] != null) continue;
+        final clientId = SyncIds.normalize(clientIdOf(records[i]));
+        if (clientId != null) candidates.add(clientId);
+      }
+      if (candidates.isNotEmpty) {
+        final mappings = await store.mappingsForLocal(name, candidates);
+        for (final mapping in mappings.values) {
+          if (mapping.isLocalOnly) unconfirmed.add(mapping.localId);
+        }
       }
     }
-    for (final raw in page.deletedServerIds) {
-      final serverId = SyncIds.normalize(raw);
-      if (serverId != null) await _applyServerDelete(cfg, serverId);
+
+    final withOps = await store.localIdsWithOperations(
+        name, {...known.values.whereType<String>(), ...unconfirmed});
+    final selfReferences = [
+      for (final reference in cfg.references)
+        if (reference.target == name) reference,
+    ];
+
+    var applied = 0;
+    // Records waiting to be written together, and their server ids.
+    final buffer = <RemoteChange>[];
+    final buffered = <String>{};
+
+    Future<void> flush() async {
+      if (buffer.isEmpty) return;
+      final changes = List<RemoteChange>.of(buffer);
+      buffer.clear();
+      buffered.clear();
+      final localIds = await cfg.local.applyRemoteBatch(changes);
+      if (localIds.length != changes.length) {
+        throw StateError('$name: applyRemoteBatch returned ${localIds.length} '
+            'local ids for ${changes.length} records; it must return one '
+            'per record, in the same order');
+      }
+      final mapped = <String, String?>{};
+      for (var i = 0; i < changes.length; i++) {
+        final change = changes[i];
+        final localId = SyncIds.normalize(localIds[i]);
+        if (localId == null) {
+          throw StateError('$name: applyRemote must return the local id');
+        }
+        if (localId != change.localId) mapped[localId] = change.serverId;
+        known[change.serverId] = localId;
+      }
+      await store.putMappings(name, mapped);
+      applied += changes.length;
+      if (_events.hasListener) {
+        for (final change in changes) {
+          _emit(SyncEvent(SyncEventType.recordPulled,
+              entity: name,
+              localId: known[change.serverId],
+              message: change.serverId));
+        }
+      }
+    }
+
+    for (var i = 0; i < records.length; i++) {
+      final serverId = serverIds[i];
+      final record = records[i];
+      // The same record twice in a page: the first copy goes in first.
+      if (buffered.contains(serverId)) await flush();
+
+      if (cfg.isDeletedOf?.call(record) ?? false) {
+        await flush();
+        await _applyServerDelete(cfg, serverId, known[serverId], withOps);
+        continue;
+      }
+
+      var localId = known[serverId];
+      if (localId == null && clientIdOf != null) {
+        final clientId = SyncIds.normalize(clientIdOf(record));
+        if (clientId != null && unconfirmed.remove(clientId)) {
+          // Created here; the create reached the server but its answer was
+          // lost. Link the two instead of storing a second copy.
+          await store.putMapping(name, clientId, serverId);
+          await cfg.local
+              .onServerIdAssigned(clientId, serverId, serverRecord: record);
+          _log(SyncLogLevel.info,
+              'Pulled $name/$serverId is local record $clientId; linked them');
+          known[serverId] = localId = clientId;
+        }
+      }
+
+      // A record that references one of its own entity which is still
+      // waiting to be written needs that one's local id first.
+      if (buffered.isNotEmpty) {
+        for (final reference in selfReferences) {
+          if (reference
+              .read(record)
+              .any((value) => buffered.contains(SyncIds.normalize(value)))) {
+            await flush();
+            break;
+          }
+        }
+      }
+      final localForm = _localForm(cfg, record, local);
+
+      if (localId != null && withOps.contains(localId)) {
+        await flush();
+        switch (await _resolvePullConflict(cfg, serverId, localId, localForm)) {
+          case _PullStep.skip:
+            continue;
+          case _PullStep.written:
+            applied++;
+            continue;
+          case _PullStep.apply:
+            break;
+        }
+      }
+      buffer.add(RemoteChange(
+          record: localForm, localId: localId, serverId: serverId));
+      buffered.add(serverId);
+    }
+    await flush();
+
+    for (final serverId in deleted) {
+      await _applyServerDelete(cfg, serverId, known[serverId], withOps);
     }
     if (saveCursor && page.nextCursor != null) {
-      await store.setMeta(_cursorKey(cfg.name), page.nextCursor);
+      await store.setMeta(_cursorKey(name), page.nextCursor);
     }
     return applied;
   }
 
-  Future<Set<String>> _recordsWithOperations(String entity) async {
-    final ops = await store.operations();
-    return {
-      for (final op in ops)
-        if (op.entity == entity) op.localId,
-    };
-  }
-
-  /// Writes one pulled record locally, unless the local copy wins a
-  /// conflict. Returns whether the local table was written.
-  Future<bool> _applyServerRecord(
+  /// Decides what happens to a pulled record whose local copy has unpushed
+  /// changes.
+  Future<_PullStep> _resolvePullConflict(
     SyncEntityConfig cfg,
     String serverId,
-    Map<String, dynamic> record,
-    Set<String> recordsWithOps,
+    String localId,
+    Map<String, dynamic> localForm,
   ) async {
-    final localId = await _localIdFor(cfg, serverId) ??
-        await _adoptOwnRecord(cfg, serverId, record);
-    final localForm = await _toLocalForm(cfg, record);
-
-    if (localId != null && recordsWithOps.contains(localId)) {
-      final pending = await store.operationsFor(cfg.name, localId);
-      if (pending.isNotEmpty) {
-        if (pending.any((o) => o.status == SyncOpStatus.inFlight)) {
-          return false;
+    final pending = await store.operationsFor(cfg.name, localId);
+    if (pending.isEmpty) return _PullStep.apply;
+    if (pending.any((o) => o.status == SyncOpStatus.inFlight)) {
+      return _PullStep.skip;
+    }
+    final resolution = await cfg.conflictResolver(SyncConflict(
+      entity: cfg.name,
+      localId: localId,
+      serverId: serverId,
+      serverRecord: localForm,
+      pendingOperations: pending,
+      source: ConflictSource.pull,
+    ));
+    _emit(SyncEvent(SyncEventType.conflictResolved,
+        entity: cfg.name,
+        localId: localId,
+        message: resolution.runtimeType.toString()));
+    switch (resolution) {
+      case KeepLocal():
+        // The local change wins: make sure it overwrites the server.
+        for (final o in pending) {
+          if (!o.force) {
+            await store.updateOperation(o.copyWith(force: true));
+          }
         }
-        final resolution = await cfg.conflictResolver(SyncConflict(
+        return _PullStep.skip;
+      case MergeResolution(:final merged):
+        await cfg.local
+            .applyRemote(merged, localId: localId, serverId: serverId);
+        for (final o in pending) {
+          await store.deleteOperation(o.id);
+        }
+        final now = _now();
+        await store.insertOperation(SyncOperation(
+          id: SyncIds.uuid(),
           entity: cfg.name,
           localId: localId,
-          serverId: serverId,
-          serverRecord: localForm,
-          pendingOperations: pending,
-          source: ConflictSource.pull,
+          type: SyncOpType.update,
+          payload: merged,
+          force: true,
+          createdAt: now,
+          updatedAt: now,
         ));
-        _emit(SyncEvent(SyncEventType.conflictResolved,
-            entity: cfg.name,
-            localId: localId,
-            message: resolution.runtimeType.toString()));
-        switch (resolution) {
-          case KeepLocal():
-            // The local change wins: make sure it overwrites the server.
-            for (final o in pending) {
-              if (!o.force) {
-                await store.updateOperation(o.copyWith(force: true));
-              }
-            }
-            return false;
-          case MergeResolution(:final merged):
-            await cfg.local
-                .applyRemote(merged, localId: localId, serverId: serverId);
-            for (final o in pending) {
-              await store.deleteOperation(o.id);
-            }
-            final now = _now();
-            await store.insertOperation(SyncOperation(
-              id: SyncIds.uuid(),
-              entity: cfg.name,
-              localId: localId,
-              type: SyncOpType.update,
-              payload: merged,
-              force: true,
-              createdAt: now,
-              updatedAt: now,
-            ));
-            return true;
-          case TakeServer():
-            for (final o in pending) {
-              await store.deleteOperation(o.id);
-            }
+        return _PullStep.written;
+      case TakeServer():
+        for (final o in pending) {
+          await store.deleteOperation(o.id);
         }
-      }
+        return _PullStep.apply;
     }
-
-    final applied = SyncIds.normalize(await cfg.local
-        .applyRemote(localForm, localId: localId, serverId: serverId));
-    if (applied == null) {
-      throw StateError('${cfg.name}: applyRemote must return the local id');
-    }
-    if (applied != localId) {
-      await store.putMapping(cfg.name, applied, serverId);
-    }
-    _emit(SyncEvent(SyncEventType.recordPulled,
-        entity: cfg.name, localId: applied, message: serverId));
-    return true;
   }
 
-  /// Links a pulled record to the local record this device created it
-  /// from, when the server echoes the client id ([SyncEntityConfig.clientIdOf])
-  /// and the create was never confirmed (e.g. its response was lost).
-  /// Without this, the pull would insert a second local copy and the create
-  /// would be sent again. Returns the adopted local id.
-  Future<String?> _adoptOwnRecord(
+  /// Removes the local copy of a record the server deleted. [localId] is
+  /// its local id, if the device has it; [withOps] the local ids known to
+  /// have operations in the outbox.
+  Future<void> _applyServerDelete(
     SyncEntityConfig cfg,
     String serverId,
-    Map<String, dynamic> record,
+    String? localId,
+    Set<String> withOps,
   ) async {
-    final clientIdOf = cfg.clientIdOf;
-    if (clientIdOf == null) return null;
-    final clientId = SyncIds.normalize(clientIdOf(record));
-    if (clientId == null) return null;
-    final mapping = await store.mappingForLocal(cfg.name, clientId);
-    // Only records created on this device and still waiting for their id.
-    if (mapping == null || !mapping.isLocalOnly) return null;
-    await store.putMapping(cfg.name, clientId, serverId);
-    await cfg.local
-        .onServerIdAssigned(clientId, serverId, serverRecord: record);
-    _log(SyncLogLevel.info,
-        'Pulled ${cfg.name}/$serverId is local record $clientId; linked them');
-    return clientId;
-  }
-
-  Future<void> _applyServerDelete(SyncEntityConfig cfg, String serverId) async {
-    final localId = await _localIdFor(cfg, serverId);
     if (localId == null) return;
-    final pending = await store.operationsFor(cfg.name, localId);
-    if (pending.isNotEmpty) {
-      _log(
-          SyncLogLevel.warning,
-          '${cfg.name}/$localId was deleted on the server; dropping '
-          '${pending.length} unpushed operation(s)');
-      for (final o in pending) {
-        await store.deleteOperation(o.id);
-        _emit(SyncEvent(SyncEventType.operationDiscarded,
-            entity: cfg.name,
-            localId: localId,
-            message: '${o.type.name}: the record was deleted on the server'));
+    if (withOps.contains(localId)) {
+      final pending = await store.operationsFor(cfg.name, localId);
+      if (pending.isNotEmpty) {
+        _log(
+            SyncLogLevel.warning,
+            '${cfg.name}/$localId was deleted on the server; dropping '
+            '${pending.length} unpushed operation(s)');
+        for (final o in pending) {
+          await store.deleteOperation(o.id);
+          _emit(SyncEvent(SyncEventType.operationDiscarded,
+              entity: cfg.name,
+              localId: localId,
+              message: '${o.type.name}: the record was deleted on the server'));
+        }
       }
     }
     // The mapping is kept so references to the record still resolve to the
@@ -1333,38 +1815,98 @@ class SyncEngine with WidgetsBindingObserver {
         entity: cfg.name, localId: localId, message: serverId));
   }
 
-  /// Converts references in a server record to local ids.
-  Future<Map<String, dynamic>> _toLocalForm(
-      SyncEntityConfig cfg, Map<String, dynamic> record) async {
-    var out = record;
-    for (final reference in cfg.references) {
-      final targetCfg = _entities[reference.target];
-      final resolved = <String, String?>{};
-      for (final value in reference.read(out)) {
-        final serverRef = SyncIds.normalize(value);
-        if (serverRef == null || resolved.containsKey(serverRef)) continue;
-        resolved[serverRef] = targetCfg == null
-            ? (await store.mappingForServer(reference.target, serverRef))
-                ?.localId
-            : await _localIdFor(targetCfg, serverRef);
+  /// The local id of each of [serverIds] of [entity], null for those the
+  /// device does not have: one lookup in the id map, then
+  /// `LocalAdapter.findLocalId` for the ones it does not hold.
+  Future<Map<String, String?>> _localIdsFor(
+    SyncEntityConfig? cfg,
+    String entity,
+    Iterable<String> serverIds,
+  ) async {
+    final wanted = serverIds.toSet();
+    final out = <String, String?>{};
+    if (wanted.isEmpty) return out;
+    final found = await store.localIdsForServer(entity, wanted);
+    for (final serverId in wanted) {
+      var localId = found[serverId];
+      if (localId == null && cfg != null) {
+        localId = SyncIds.normalize(await cfg.local.findLocalId(serverId));
+        if (localId != null) await store.putMapping(entity, localId, serverId);
       }
-      if (resolved.values.any((v) => v != null)) {
-        out = reference.rewrite(out, (value) {
-          final localRef = resolved[SyncIds.normalize(value)];
-          return localRef == null
-              ? value
-              : SyncIds.toJsonValue(localRef, value);
-        });
-      }
+      out[serverId] = localId;
     }
     return out;
   }
 
-  Future<String?> _serverIdFor(SyncEntityConfig cfg, String localId) async {
-    final mapping = await store.mappingForLocal(cfg.name, localId);
+  /// Adds to [local] the local ids of everything [records] of [cfg]
+  /// reference, one lookup per referenced entity.
+  Future<void> _loadReferences(
+    SyncEntityConfig cfg,
+    List<Map<String, dynamic>> records,
+    Map<String, Map<String, String?>> local,
+  ) async {
+    for (final reference in cfg.references) {
+      final target = local.putIfAbsent(reference.target, () => {});
+      final wanted = <String>{};
+      for (final record in records) {
+        for (final value in reference.read(record)) {
+          final serverRef = SyncIds.normalize(value);
+          if (serverRef != null && !target.containsKey(serverRef)) {
+            wanted.add(serverRef);
+          }
+        }
+      }
+      if (wanted.isEmpty) continue;
+      target.addAll(await _localIdsFor(
+          _entities[reference.target], reference.target, wanted));
+    }
+  }
+
+  /// [record] with its references converted to the local ids in [local].
+  /// The record itself is returned when nothing had to change.
+  Map<String, dynamic> _localForm(
+    SyncEntityConfig cfg,
+    Map<String, dynamic> record,
+    Map<String, Map<String, String?>> local,
+  ) {
+    Map<String, dynamic>? copy;
+    for (final reference in cfg.references) {
+      final resolved = local[reference.target];
+      if (resolved == null) continue;
+      if (!reference
+          .read(copy ?? record)
+          .any((value) => resolved[SyncIds.normalize(value)] != null)) {
+        continue;
+      }
+      // Copied once, however many references it has.
+      copy ??= deepCopyJson(record);
+      reference.rewriteInPlace(copy, (value) {
+        final localRef = resolved[SyncIds.normalize(value)];
+        return localRef == null ? value : SyncIds.toJsonValue(localRef, value);
+      });
+    }
+    return copy ?? record;
+  }
+
+  /// Converts references in one server record to local ids.
+  Future<Map<String, dynamic>> _toLocalForm(
+      SyncEntityConfig cfg, Map<String, dynamic> record) async {
+    final local = <String, Map<String, String?>>{};
+    await _loadReferences(cfg, [record], local);
+    return _localForm(cfg, record, local);
+  }
+
+  Future<String?> _serverIdFor(SyncEntityConfig cfg, String localId,
+      [_Mappings? mappings]) async {
+    final mapping = mappings == null
+        ? await store.mappingForLocal(cfg.name, localId)
+        : await mappings.forLocal(cfg.name, localId);
     if (mapping != null) return mapping.serverId;
     final legacy = SyncIds.normalize(await cfg.local.findServerId(localId));
-    if (legacy != null) await store.putMapping(cfg.name, localId, legacy);
+    if (legacy != null) {
+      await store.putMapping(cfg.name, localId, legacy);
+      mappings?.put(cfg.name, localId, legacy);
+    }
     return legacy;
   }
 
@@ -1379,16 +1921,36 @@ class SyncEngine with WidgetsBindingObserver {
   // Inspection & maintenance --------------------------------------------------
 
   /// Operations waiting to be pushed, oldest first.
-  Future<List<SyncOperation>> pendingOperations() async {
-    await _ensureInit();
-    return store
-        .operations(statuses: {SyncOpStatus.pending, SyncOpStatus.inFlight});
-  }
+  ///
+  /// With a large outbox, read it a page at a time: pass [limit], then the
+  /// `seq` of the last operation of a page as [afterSeq] for the next one.
+  /// `status.value.pendingCount` gives the total without loading anything.
+  Future<List<SyncOperation>> pendingOperations({
+    int? limit,
+    int afterSeq = 0,
+  }) =>
+      _listOperations(
+          const {SyncOpStatus.pending, SyncOpStatus.inFlight}, limit, afterSeq);
 
-  /// Operations that need attention.
-  Future<List<SyncOperation>> failedOperations() async {
+  /// Operations that need attention, oldest first. [limit] and [afterSeq]
+  /// page through them as in [pendingOperations].
+  Future<List<SyncOperation>> failedOperations({
+    int? limit,
+    int afterSeq = 0,
+  }) =>
+      _listOperations(const {SyncOpStatus.failed}, limit, afterSeq);
+
+  Future<List<SyncOperation>> _listOperations(
+      Set<SyncOpStatus> statuses, int? limit, int afterSeq) async {
     await _ensureInit();
-    return store.operations(statuses: {SyncOpStatus.failed});
+    if (limit == null && afterSeq <= 0) {
+      return store.operations(statuses: statuses);
+    }
+    return store.operationsPage(
+        statuses: statuses,
+        afterSeq: afterSeq,
+        // No limit: everything after [afterSeq].
+        limit: limit ?? 0x7fffffff);
   }
 
   /// Every unpushed operation of one record, oldest first. Use it to show
@@ -1405,27 +1967,44 @@ class SyncEngine with WidgetsBindingObserver {
   /// queue with a fresh attempt budget, then schedules a push.
   Future<void> retryFailed([String? operationId]) async {
     await _ensureInit();
-    final failed = await store.operations(statuses: {SyncOpStatus.failed});
-    for (final op in failed) {
-      if (operationId != null && op.id != operationId) continue;
-      // Re-read: the app may have edited the record in the meantime.
+    // A page at a time, each in one transaction.
+    var afterSeq = 0;
+    while (true) {
+      final List<SyncOperation> page;
+      if (operationId != null) {
+        final op = await store.operationById(operationId);
+        page = [if (op != null) op];
+      } else {
+        page = await store.operationsPage(
+            statuses: const {SyncOpStatus.failed},
+            afterSeq: afterSeq,
+            limit: _outboxPage);
+      }
+      if (page.isEmpty) break;
       final retried = await store.transaction(() async {
-        final fresh = await store.operationById(op.id);
-        if (fresh == null || !fresh.isFailed) return false;
-        await store.updateOperation(fresh.copyWith(
-          status: SyncOpStatus.pending,
-          attempts: 0,
-          clearNextAttemptAt: true,
-          clearLastError: true,
-        ));
-        return true;
+        final done = <SyncOperation>[];
+        for (final listed in page) {
+          // Re-read: the app may have edited the record in the meantime.
+          final fresh = await store.operationById(listed.id);
+          if (fresh == null || !fresh.isFailed) continue;
+          await store.updateOperation(fresh.copyWith(
+            status: SyncOpStatus.pending,
+            attempts: 0,
+            clearNextAttemptAt: true,
+            clearLastError: true,
+          ));
+          done.add(fresh);
+        }
+        return done;
       });
-      if (retried) {
+      for (final op in retried) {
         _emit(SyncEvent(SyncEventType.operationRetried,
             entity: op.entity, localId: op.localId, message: op.type.name));
       }
+      if (operationId != null || page.length < _outboxPage) break;
+      afterSeq = page.last.seq!;
     }
-    await _refreshCounts();
+    await _refreshCounts(force: true);
     _schedule(pull: false);
   }
 
@@ -1440,7 +2019,7 @@ class SyncEngine with WidgetsBindingObserver {
     await store.deleteOperation(operationId);
     _emit(SyncEvent(SyncEventType.operationDiscarded,
         entity: op.entity, localId: op.localId, message: op.type.name));
-    await _refreshCounts();
+    await _refreshCounts(force: true);
     // Later operations of the record, and records that waited for it, can
     // now go ahead (or fail visibly).
     _schedule(pull: false);
@@ -1548,7 +2127,7 @@ class SyncEngine with WidgetsBindingObserver {
   Future<void> registerMappings(
       String entity, Map<Object, Object> localToServer) async {
     _config(entity);
-    final pairs = <(String, String)>[];
+    final pairs = <String, String?>{};
     localToServer.forEach((localId, serverId) {
       final l = SyncIds.normalize(localId);
       final s = SyncIds.normalize(serverId);
@@ -1556,14 +2135,19 @@ class SyncEngine with WidgetsBindingObserver {
         throw ArgumentError.value(
             '$localId -> $serverId', 'localToServer', 'holds an empty id');
       }
-      pairs.add((l, s));
+      pairs[l] = s;
     });
     if (pairs.isEmpty) return;
     await _ensureInit();
     await store.transaction(() async {
-      for (final (l, s) in pairs) {
-        await store.putMapping(entity, l, s);
-        await store.setMeta(_viaKey(entity, l), null);
+      // Only a record declared with [recordCreatedVia] has a link to
+      // forget, and such a record is known as local-only until now.
+      final before = await store.mappingsForLocal(entity, pairs.keys);
+      await store.putMappings(entity, pairs);
+      for (final mapping in before.values) {
+        if (mapping.isLocalOnly) {
+          await store.setMeta(_viaKey(entity, mapping.localId), null);
+        }
       }
     });
   }
@@ -1583,16 +2167,21 @@ class SyncEngine with WidgetsBindingObserver {
   /// Wipes outbox, id map and cursors (for logout or a tenant switch).
   /// Unpushed changes are lost; check [status] first.
   ///
-  /// Waits for a run in progress, so nothing it was doing is written back
-  /// afterwards.
+  /// A run in progress is stopped first (see [cancelSync]) and waited for,
+  /// so signing out never waits for a long sync to finish, and nothing the
+  /// run was doing is written back afterwards.
   Future<void> clear() async {
     await _ensureInit();
+    if (!_inRun) await cancelSync();
     await _exclusive(() async {
       _retryTimer?.cancel();
       _retryTimer = null;
+      _serverBusyUntil = null;
+      _unavailableStops = 0;
+      _owesPull = false;
       await store.clear();
       _setStatus(SyncStatus(isOnline: _status.value.isOnline));
-      await _refreshCounts();
+      await _refreshCounts(force: true);
       _emit(const SyncEvent(SyncEventType.storeCleared));
     });
   }
@@ -1610,8 +2199,6 @@ class SyncEngine with WidgetsBindingObserver {
 
   DateTime _now() => (config.clock ?? DateTime.now)();
 
-  String _recordKey(String entity, String localId) => '$entity\u0000$localId';
-
   String _cursorKey(String entity) => 'cursor:$entity';
 
   String _viaKey(String entity, String localId) => 'via:$entity\u0000$localId';
@@ -1623,15 +2210,42 @@ class SyncEngine with WidgetsBindingObserver {
   void _setCurrent(SyncPhase phase, String entity) =>
       _setStatus(_status.value.copyWith(phase: phase, currentEntity: entity));
 
-  Future<void> _refreshCounts() async {
+  /// Below this many operations the outbox is counted after every change.
+  static const _countEveryTimeBelow = 2000;
+
+  /// Updates the counts in [status].
+  ///
+  /// Counting reads an index of the whole outbox. A small outbox is counted
+  /// after every change; a large one at intervals that grow with its size
+  /// (0.1 s at 20 000 operations, 5 s at a million), or recording and
+  /// pushing a million operations would count a million rows a million
+  /// times. The count is always exact when a run ends ([force]).
+  Future<void> _refreshCounts({bool force = false}) async {
     if (_disposed) return;
+    if (!force && _countedOperations > _countEveryTimeBelow) {
+      final wait =
+          Duration(microseconds: _countedOperations * 5) - _sinceCount.elapsed;
+      if (wait > Duration.zero) {
+        _countTimer ??= _home.createTimer(wait, () {
+          _countTimer = null;
+          _refreshCounts(force: true);
+        });
+        return;
+      }
+    }
+    _countTimer?.cancel();
+    _countTimer = null;
     try {
       final counts = await store.countByStatus();
-      _setStatus(_status.value.copyWith(
-        pendingCount:
-            counts[SyncOpStatus.pending]! + counts[SyncOpStatus.inFlight]!,
-        failedCount: counts[SyncOpStatus.failed]!,
-      ));
+      final pending =
+          counts[SyncOpStatus.pending]! + counts[SyncOpStatus.inFlight]!;
+      final failed = counts[SyncOpStatus.failed]!;
+      _countedOperations = pending + failed;
+      _sinceCount
+        ..reset()
+        ..start();
+      _setStatus(
+          _status.value.copyWith(pendingCount: pending, failedCount: failed));
     } catch (e, st) {
       _log(SyncLogLevel.warning, 'Could not count the outbox', e, st);
     }
@@ -1736,16 +2350,89 @@ class _RunRequest {
   }
 }
 
-/// What happened to one operation during a push pass.
-enum _Step {
-  /// Accepted by the server.
-  pushed,
+/// What to do with a pulled record whose local copy has unpushed changes.
+enum _PullStep {
+  /// The local copy stays as it is.
+  skip,
 
-  /// Left for later (waiting, backoff, failed or aborted).
-  held,
+  /// The resolver's merge was written.
+  written,
 
-  /// A conflict was resolved; the record may be pushed in the next pass.
-  resolved,
+  /// The server's version is written like any other pulled record.
+  apply,
+}
+
+/// The id mappings read while preparing a group of operations, so each is
+/// looked up once.
+class _Mappings {
+  _Mappings(this.store);
+
+  final SyncStore store;
+
+  /// By entity and local id; a null value means "no mapping".
+  final Map<String, Map<String, IdMapping?>> _known = {};
+
+  /// Reads the mappings of [localIds] of [entity] in one lookup.
+  Future<void> load(String entity, Iterable<String> localIds) async {
+    final known = _known.putIfAbsent(entity, () => {});
+    final wanted = {
+      for (final id in localIds)
+        if (!known.containsKey(id)) id,
+    };
+    if (wanted.isEmpty) return;
+    final found = await store.mappingsForLocal(entity, wanted);
+    for (final id in wanted) {
+      known[id] = found[id];
+    }
+  }
+
+  Future<IdMapping?> forLocal(String entity, String localId) async {
+    final known = _known.putIfAbsent(entity, () => {});
+    if (known.containsKey(localId)) return known[localId];
+    return known[localId] = await store.mappingForLocal(entity, localId);
+  }
+
+  void put(String entity, String localId, String serverId) =>
+      _known.putIfAbsent(entity, () => {})[localId] =
+          IdMapping(entity: entity, localId: localId, serverId: serverId);
+
+  /// What the outbox holds for a record others reference, by entity and
+  /// local id.
+  final Map<String, Map<String, ({bool failed, bool creating})>> _queued = {};
+
+  /// Whether the record has a failed operation, and whether its create is
+  /// still in the outbox.
+  Future<({bool failed, bool creating})> queueOf(
+      String entity, String localId) async {
+    final queued = _queued.putIfAbsent(entity, () => {});
+    final known = queued[localId];
+    if (known != null) return known;
+    final ops = await store.operationsFor(entity, localId);
+    return queued[localId] = (
+      failed: ops.any((o) => o.isFailed),
+      creating: ops.any((o) => o.type == SyncOpType.create),
+    );
+  }
+
+  /// Forgets everything: operations were pushed, so mappings changed.
+  void clear() {
+    _known.clear();
+    _queued.clear();
+  }
+}
+
+/// An operation the server accepted.
+class _Accepted {
+  const _Accepted(this.op, this.request, this.outcome, this.serverId);
+
+  final SyncOperation op;
+  final PushRequest request;
+  final PushSuccess outcome;
+
+  /// The record's server id: the new one for a create.
+  final String? serverId;
+
+  bool get isCreate => request.type == SyncOpType.create;
 }
 
 sealed class _Prepared {
@@ -1753,7 +2440,10 @@ sealed class _Prepared {
 }
 
 class _Ready extends _Prepared {
-  const _Ready(this.request);
+  const _Ready(this.op, this.request);
+
+  /// The claimed operation, as stored.
+  final SyncOperation op;
   final PushRequest request;
 }
 

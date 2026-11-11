@@ -33,6 +33,13 @@ without overwriting edits that have not been pushed yet.
   backoff delay ends, and on demand. Only one sync run at a time; requests
   made during a run are merged into a single follow-up run, so nothing is
   lost.
+- **Built for large data sets** — the outbox is walked a page at a time and
+  pulled pages are looked up and written as a whole, so memory use and the
+  cost of each record stay the same with a thousand rows or with millions.
+  Uploads can go out in batches or in parallel, a long sync reports its
+  progress and can be cancelled, and a server that is down is left alone
+  instead of being sent the whole backlog. See
+  [Large data sets](#large-data-sets).
 - **UI-ready state** — a `ValueListenable<SyncStatus>`, per-record state
   streams, and an event stream.
 - **Works with your stack** — no mandatory dependencies. Keep the outbox in
@@ -144,6 +151,7 @@ SyncStatusBuilder(
   builder: (context, s) => switch (s.phase) {
     SyncPhase.offline => const Text('Offline – changes are saved locally'),
     SyncPhase.authRequired => const Text('Session expired, please sign in again'),
+    SyncPhase.serverUnavailable => const Text('Server busy – will retry shortly'),
     _ when s.failedCount > 0 => Text('${s.failedCount} operation(s) need review'),
     _ when s.pendingCount > 0 => Text('${s.pendingCount} pending upload'),
     _ => const Text('Synced'),
@@ -258,7 +266,7 @@ follows:
 | `isAlreadyExists` returns true for a create | success: the existing record is adopted |
 | 409 | conflict |
 | 404 to a delete | success (already gone) |
-| 408, 425, 429, 5xx | retry, honoring a `Retry-After` (seconds or HTTP date) longer than the retry policy's delay |
+| 408, 425, 429, 5xx | retry, honoring a `Retry-After` (seconds or HTTP date) longer than the retry policy's delay; 429, 502, 503 and 504 also count as "server unavailable" |
 | anything else, including 3xx and 403 | rejected: the operation is kept as failed |
 
 403 usually means "not allowed for this record", so it fails that one
@@ -299,7 +307,7 @@ For any unusual API, implement `RemoteAdapter` directly and return a
 |---|---|---|
 | `success(serverId:)` | Change accepted (or already existed, with its id) | Operation is removed and the id is mapped |
 | `networkError` | Server unreachable | Sync stops without counting an attempt |
-| `retry` | 5xx, 429, or timeout | Backoff then retry; counts as an attempt |
+| `retry` | 5xx, 429, or timeout | Backoff then retry; counts as an attempt. With `serverUnavailable: true`, three in a row pause sync (see [Large data sets](#large-data-sets)) |
 | `rejected` | Validation error | Operation is marked failed; dependent records wait |
 | `conflict` | Server holds a newer version | The conflict resolver decides |
 | `unauthorized` | Token expired | Sync stops, `SyncPhase.authRequired` |
@@ -316,7 +324,7 @@ and state management your app already uses. No adapter package is needed.
 | SQLite: drift, sqflite, sqlite3, floor, SQLCipher | `SqlSyncStore` + `CallbackSqlExecutor`: the outbox lives in your database and commits with your rows |
 | Hive, SharedPreferences, Isar, ObjectBox, GetStorage, secure storage | `KeyValueSyncStore` + `CallbackKeyValueStorage` |
 | Tests, prototypes | `InMemorySyncStore` |
-| Anything else | implement `SyncStore` |
+| Anything else | extend `SyncStore` |
 
 `SqlSyncStore` creates three tables (`sync_outbox`, `sync_id_map`,
 `sync_meta`) with `IF NOT EXISTS`, so your schema needs no migration.
@@ -362,8 +370,15 @@ await db.transaction(() async {
 `CallbackSqlExecutor`'s documentation also shows `sqlite3`. You can still
 implement `SqlExecutor` yourself.
 
-Without SQLite, `KeyValueSyncStore` saves the outbox as one JSON value after
-every change. It suits outboxes of up to a few thousand operations.
+To write your own store, extend `SyncStore` and implement its abstract
+members. The paged and batched members (`operationsPage`, `putMappings`,
+...) have working fallbacks built on those; override them too if the store
+is meant for large data sets.
+
+Without SQLite, `KeyValueSyncStore` saves the outbox and the id map as one
+JSON value after every change. It suits small data sets: up to a few
+thousand queued operations and synchronized records. Beyond that, use
+`SqlSyncStore`.
 
 ```dart
 // SharedPreferences
@@ -608,6 +623,102 @@ a push that the server answered with `conflict`.
 - `conflictResolver: (c) => ConflictResolution.merge({...})` for field-level
   merging.
 
+## Large data sets
+
+Nothing in the engine reads the whole outbox or the whole id map. The
+outbox is walked a page at a time through its indexes; a pulled page costs a
+fixed number of lookups whatever its size; counts, the next retry time and
+"which of these records have unpushed changes" are each one indexed query.
+What is left to you is how rows reach your tables and your server:
+
+| For | Do |
+|---|---|
+| A large first download | Override `LocalAdapter.applyRemoteBatch` to write a page with one statement or one database batch. Use `PullMode.incremental` and a `pullPageSize` of 500 to 2000. |
+| A large upload | Set `pushBatchSize`. With a bulk endpoint, implement `RemoteAdapter.pushBatch`; without one, a `pushBatchSize` of 4 to 8 sends that many requests side by side. |
+| Storage | `SqlSyncStore`. (`KeyValueSyncStore` rewrites its whole state on every change.) |
+| Recording many changes at once | Wrap them in one transaction of your database. |
+| A progress bar | `status.runPulled`, `status.runPushed` and `status.currentEntity`; `sync.cancelSync()` for a Cancel button. |
+| Showing the outbox | `pendingOperations(limit: 50, afterSeq: lastSeq)`; the totals are in `status`. |
+
+Writing a page at once (sqflite shown; drift's `batch` works the same way):
+
+```dart
+class ProductsLocal extends LocalAdapter {
+  // applyRemote stays, for single records (conflicts, merges).
+
+  @override
+  Future<List<String>> applyRemoteBatch(List<RemoteChange> changes) async {
+    final ids = [for (final c in changes) c.localId ?? SyncEngine.newLocalId()];
+    final batch = executor.current.batch(); // the page's transaction
+    for (var i = 0; i < changes.length; i++) {
+      batch.insert('products', toRow(ids[i], changes[i].record, changes[i].serverId),
+          conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+    return ids; // one local id per change, in the same order
+  }
+}
+```
+
+Sending operations together:
+
+```dart
+SyncEntityConfig(
+  name: 'readings',
+  pushBatchSize: 200,
+  remote: CallbackRemoteAdapter(
+    push: pushOne,
+    pushBatch: (requests) async {
+      final response = await api.post('readings/bulk', [
+        for (final r in requests)
+          {'op': r.type.name, 'id': r.serverId, 'key': r.idempotencyKey, 'data': r.payload},
+      ]);
+      // One outcome per request, in the same order: each operation is
+      // settled on its own.
+      return [
+        for (final item in response.results)
+          item.ok
+              ? PushOutcome.success(serverId: item.id)
+              : PushOutcome.rejected(item.error),
+      ];
+    },
+  ),
+  // ...
+);
+```
+
+Only operations that follow each other in the outbox, belong to one entity
+and to different records are grouped, and each still waits for the records
+it references: the ordering guarantees are those of sending one at a time.
+A batch is claimed and recorded in one transaction each, which is what
+makes it cheap.
+
+**A server in trouble is left alone.** When three pushes in a row are
+answered "unavailable" (HTTP 429, 502, 503 or 504 with `RestRemoteAdapter`;
+`PushOutcome.retry(error, serverUnavailable: true)` from your own adapter),
+the run stops the way it stops for a lost connection: the rest of the outbox
+is not sent and keeps its attempts. `status.phase` becomes
+`serverUnavailable`, and sync resumes by itself at `status.nextRetryAt`,
+with a delay that grows while the server stays down (or the server's
+`Retry-After`). `syncNow(ignoreBackoff: true)` tries at once.
+`SyncConfig.serverUnavailableThreshold` changes the count; `null` turns it
+off. An ordinary 500 never counts: it may be about one record only.
+
+**Waiting is free.** Records that wait for a parent the server rejected are
+looked at on each sync but not rewritten, and the lookup is shared by all
+that wait for the same parent, so ten thousand bills behind one failed
+customer do not slow every sync down.
+
+Two things stay proportional to the data and are yours to choose:
+`PullMode.fullRefresh` hands every server id seen to
+`onFullRefreshComplete` (use `incremental` for big tables), and your
+transport decodes each page of JSON (do it in an isolate, with `compute`,
+when pages are large).
+
+[`benchmark/`](benchmark/sync_benchmark_test.dart) measures all of this on
+SQLite; run it with `flutter test benchmark/sync_benchmark_test.dart`
+(`--dart-define=SCALE=10` pulls a million records).
+
 ## Configuration
 
 ```dart
@@ -618,6 +729,8 @@ SyncConfig(
   periodicInterval: Duration(minutes: 5),
   syncOnStart: true, syncOnResume: true, syncOnReconnect: true,
   autoPushAfterWrite: true,
+  outboxPageSize: 200,             // operations read from the outbox at a time
+  serverUnavailableThreshold: 3,   // 429/502/503/504 in a row before pausing
   canSync: () => auth.isLoggedIn,
   onUnauthorized: () => auth.refreshToken(),
   onOperationFailed: (op, error) => showSnack('${op.entity}: $error'),
@@ -625,7 +738,8 @@ SyncConfig(
 );
 ```
 
-Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushEnabled`,
+Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushBatchSize`,
+`pushEnabled`,
 `coalesce`, `mergePayload`, `serverIdOf`, `serverIdToJson`, `clientIdOf`,
 `updatedAtOf`, `isDeletedOf` (for server-deleted records), and
 `unknownReferencePolicy`.
@@ -633,8 +747,14 @@ Per-entity settings on `SyncEntityConfig`: `pullPageSize`, `pushEnabled`,
 `syncNow`, `pushNow` and `pullNow` accept `entities: {...}` to limit a run.
 Operations that hit a temporary failure wait out their backoff delay; a
 "Sync now" button should call `syncNow(ignoreBackoff: true)` to try them
-again at once. `clear()` (for logout) and `resetPullCursor()` wait for a run
-in progress.
+again at once. `cancelSync()` stops a run after the operations or the page
+it is working on; nothing is lost, the next sync carries on from there.
+`clear()` (for logout) and `dispose()` stop a run the same way rather than
+wait for it to finish; `resetPullCursor()` waits for it.
+
+Automatic syncs run in the zone `start()` was called in. Do not `await` a
+sync inside a database transaction: with a single connection the sync would
+wait for the transaction, and the transaction for the sync.
 
 ## Testing
 

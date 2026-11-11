@@ -13,6 +13,10 @@ enum SyncPhase {
 
   /// `SyncConfig.canSync` returned false (e.g. no session yet).
   paused,
+
+  /// The server answered that it is overloaded or down. Sync is paused and
+  /// resumes by itself at [SyncStatus.nextRetryAt].
+  serverUnavailable,
 }
 
 /// Snapshot of the engine state for the UI.
@@ -29,6 +33,8 @@ class SyncStatus {
     this.lastSyncedAt,
     this.lastError,
     this.nextRetryAt,
+    this.runPushed = 0,
+    this.runPulled = 0,
   });
 
   final SyncPhase phase;
@@ -54,6 +60,15 @@ class SyncStatus {
   /// time by itself. Null when no operation is backing off.
   final DateTime? nextRetryAt;
 
+  /// Operations pushed so far by the run in progress (or by the last run):
+  /// progress for a long upload.
+  final int runPushed;
+
+  /// Records pulled so far by the run in progress (or by the last run),
+  /// updated after every page: progress for a long first download, together
+  /// with [currentEntity].
+  final int runPulled;
+
   bool get isSyncing =>
       phase == SyncPhase.pushing || phase == SyncPhase.pulling;
 
@@ -72,6 +87,8 @@ class SyncStatus {
     bool clearLastError = false,
     DateTime? nextRetryAt,
     bool clearNextRetryAt = false,
+    int? runPushed,
+    int? runPulled,
   }) {
     return SyncStatus(
       phase: phase ?? this.phase,
@@ -83,6 +100,8 @@ class SyncStatus {
       lastSyncedAt: lastSyncedAt ?? this.lastSyncedAt,
       lastError: clearLastError ? null : (lastError ?? this.lastError),
       nextRetryAt: clearNextRetryAt ? null : (nextRetryAt ?? this.nextRetryAt),
+      runPushed: runPushed ?? this.runPushed,
+      runPulled: runPulled ?? this.runPulled,
     );
   }
 
@@ -97,11 +116,22 @@ class SyncStatus {
           other.currentEntity == currentEntity &&
           other.lastSyncedAt == lastSyncedAt &&
           other.lastError == lastError &&
-          other.nextRetryAt == nextRetryAt;
+          other.nextRetryAt == nextRetryAt &&
+          other.runPushed == runPushed &&
+          other.runPulled == runPulled;
 
   @override
-  int get hashCode => Object.hash(phase, isOnline, pendingCount, failedCount,
-      currentEntity, lastSyncedAt, lastError, nextRetryAt);
+  int get hashCode => Object.hash(
+      phase,
+      isOnline,
+      pendingCount,
+      failedCount,
+      currentEntity,
+      lastSyncedAt,
+      lastError,
+      nextRetryAt,
+      runPushed,
+      runPulled);
 
   @override
   String toString() => 'SyncStatus(${phase.name}, online: $isOnline, '
@@ -121,7 +151,23 @@ enum RecordSyncState {
 }
 
 /// Why a run stopped early.
-enum SyncAbortReason { offline, unauthorized, paused }
+enum SyncAbortReason {
+  /// The server could not be reached.
+  offline,
+
+  /// The server rejected the credentials.
+  unauthorized,
+
+  /// `SyncConfig.canSync` returned false, or the engine was disposed.
+  paused,
+
+  /// The server answered that it is overloaded or down (see
+  /// `SyncConfig.serverUnavailableThreshold`). Sync resumes by itself.
+  serverUnavailable,
+
+  /// `SyncEngine.cancelSync` (or `clear`, or `dispose`) stopped the run.
+  cancelled,
+}
 
 /// Summary of one run.
 class SyncRunResult {

@@ -123,6 +123,7 @@ SyncEntityConfig entity(
   RemoteAdapter? remote,
   LocalAdapter? local,
   int pullPageSize = 500,
+  int pushBatchSize = 1,
 }) =>
     SyncEntityConfig(
       name: name,
@@ -139,6 +140,7 @@ SyncEntityConfig entity(
       updatedAtOf: updatedAtOf,
       isDeletedOf: isDeletedOf,
       pullPageSize: pullPageSize,
+      pushBatchSize: pushBatchSize,
     );
 
 /// A [SqlExecutor] for sqflite that routes statements made inside
@@ -175,6 +177,106 @@ Future<Database> openTestDatabase() {
   sqfliteFfiInit();
   return databaseFactoryFfiNoIsolate.openDatabase(inMemoryDatabasePath,
       options: OpenDatabaseOptions(singleInstance: false));
+}
+
+/// An [InMemorySyncStore] that counts the calls made to it.
+class CountingStore extends InMemorySyncStore {
+  final Map<String, int> calls = {};
+
+  int count(String name) => calls[name] ?? 0;
+
+  void _called(String name) => calls[name] = count(name) + 1;
+
+  @override
+  Future<List<SyncOperation>> operations({Set<SyncOpStatus>? statuses}) {
+    _called('operations');
+    return super.operations(statuses: statuses);
+  }
+
+  @override
+  Future<List<SyncOperation>> operationsFor(String entity, String localId) {
+    _called('operationsFor');
+    return super.operationsFor(entity, localId);
+  }
+
+  @override
+  Future<Map<SyncOpStatus, int>> countByStatus() {
+    _called('countByStatus');
+    return super.countByStatus();
+  }
+
+  @override
+  Future<IdMapping?> mappingForLocal(String entity, String localId) {
+    _called('mappingForLocal');
+    return super.mappingForLocal(entity, localId);
+  }
+
+  @override
+  Future<IdMapping?> mappingForServer(String entity, String serverId) {
+    _called('mappingForServer');
+    return super.mappingForServer(entity, serverId);
+  }
+
+  @override
+  Future<void> putMapping(String entity, String localId, String? serverId) {
+    _called('putMapping');
+    return super.putMapping(entity, localId, serverId);
+  }
+
+  @override
+  Future<void> putMappings(String entity, Map<String, String?> localToServer) {
+    _called('putMappings');
+    return super.putMappings(entity, localToServer);
+  }
+
+  @override
+  Future<Map<String, String>> localIdsForServer(
+      String entity, Iterable<String> serverIds) {
+    _called('localIdsForServer');
+    return super.localIdsForServer(entity, serverIds);
+  }
+
+  @override
+  Future<Set<String>> localIdsWithOperations(
+      String entity, Iterable<String> localIds) {
+    _called('localIdsWithOperations');
+    return super.localIdsWithOperations(entity, localIds);
+  }
+
+  @override
+  Future<List<SyncOperation>> operationsPage({
+    Set<SyncOpStatus>? statuses,
+    Set<String>? entities,
+    DateTime? dueAt,
+    int afterSeq = 0,
+    required int limit,
+  }) {
+    _called('operationsPage');
+    return super.operationsPage(
+        statuses: statuses,
+        entities: entities,
+        dueAt: dueAt,
+        afterSeq: afterSeq,
+        limit: limit);
+  }
+
+  @override
+  Future<void> updateOperation(SyncOperation operation) {
+    _called('updateOperation');
+    return super.updateOperation(operation);
+  }
+
+  @override
+  Future<void> markOperations(Iterable<String> ids, SyncOpStatus status) {
+    _called('markOperations');
+    return super.markOperations(ids, status);
+  }
+
+  @override
+  Future<T> transaction<T>(Future<T> Function() action) {
+    _called('transaction');
+    return super.transaction(action);
+  }
 }
 
 /// Lets queued microtasks and zero-duration timers run.

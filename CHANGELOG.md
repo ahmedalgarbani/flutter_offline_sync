@@ -1,3 +1,106 @@
+## 0.4.0
+
+Scale release: the engine, the stores and the adapters now work in pages and
+batches, so the cost of a record and the memory used no longer grow with the
+amount of data. A first download is 3.5 times faster as it is and 20 times
+faster with the new batch write; an upload is up to 44 times faster through
+a bulk endpoint. One serious bug in automatic sync is fixed. Read
+**Behavior changes** before upgrading.
+
+Measured with the new [`benchmark/`](benchmark/sync_benchmark_test.dart) on
+SQLite (a file database, the remote answering at once), 0.3.0 against 0.4.0:
+
+| | 0.3.0 | 0.4.0 |
+|---|---|---|
+| Pull 100 000 records, `applyRemote` | 42.6 s | 12.0 s |
+| Pull 100 000 records, `applyRemoteBatch` | | 2.1 s |
+| Push 20 000 operations, one at a time | 98 s | 85 s |
+| Push 20 000 operations, 8 side by side | | 14.1 s |
+| Push 20 000 operations, bulk endpoint | | 2.2 s |
+| Record 20 000 changes | 17.2 s | 10.5 s |
+| A sync with nothing to do, 20 000 failed operations kept | 150 ms | 1.6 ms |
+
+A million records were pulled in 22 s (`applyRemoteBatch`), at the same
+rate per record as 100 000, and 200 000 operations were pushed through a
+bulk endpoint in 27 s. Sending one operation at a time costs what it did:
+it is bound by one request and two commits per operation, which is what
+`pushBatchSize` is for.
+
+### Behavior changes
+
+- **Custom stores must extend `SyncStore`.** It has new members with working
+  default implementations; a class that `implements SyncStore` no longer
+  compiles until it says `extends` (or implements them).
+- **New enum values.** `SyncPhase.serverUnavailable`,
+  `SyncAbortReason.serverUnavailable` and `SyncAbortReason.cancelled`: a
+  `switch` over these enums without a default needs the new cases.
+- **A server that is unavailable pauses sync.** After three pushes in a row
+  answered 429, 502, 503 or 504 (or `PushOutcome.retry(...,
+  serverUnavailable: true)`), the run stops and the rest of the outbox is
+  not sent. Sync resumes by itself after a delay that grows while the
+  server stays down. Until now every operation in the outbox was sent, and
+  lost an attempt, on every run. `SyncConfig(serverUnavailableThreshold:
+  null)` restores that.
+- **`dispose()` and `clear()` no longer wait for a long run to finish.** The
+  run stops after the operations or the page it is working on and reports
+  `SyncAbortReason.cancelled`.
+- **Automatic syncs run in the zone `start()` was called in**, not in the
+  zone of the call that triggered them (see the first fix).
+- With more than 2 000 operations in the outbox, `status.pendingCount` and
+  `failedCount` are refreshed at intervals (0.1 s at 20 000 operations)
+  instead of after every change. They are exact whenever a run ends.
+- An operation is held back by an earlier unpushed operation of its record,
+  no longer by a failed later one.
+- `SqlSyncStore.init()` creates one more index (`idx_<prefix>outbox_retry`).
+
+### Fixes
+
+- **A change recorded inside a database transaction was not pushed
+  automatically.** `recordCreate` and the others scheduled the push from
+  the zone they were called in. Called inside `executor.transaction(...)`,
+  as the documentation recommends, that zone was the transaction: when the
+  timer fired the transaction was over, and the push failed on its first
+  statement (`transaction_closed` with sqflite). The change stayed in the
+  outbox until something else triggered a sync.
+- Costs that grew with the square of the outbox: the outbox was counted
+  after every recorded and every pushed operation, and loaded whole for
+  every push pass, every pulled page and at the end of every run.
+- `InMemorySyncStore` copied its whole state at the start of every
+  transaction and searched the id map row by row; `KeyValueSyncStore`
+  inherits both fixes.
+- Records waiting for a parent whose push had failed were claimed and put
+  back, two writes each, on every sync.
+- An incremental pull kept every server id it had seen in memory.
+- A store error in the middle of a push left the operation "in flight", and
+  unsendable, until the app was started again.
+
+### Features
+
+- `SyncEntityConfig.pushBatchSize` and `RemoteAdapter.pushBatch` (also on
+  `CallbackRemoteAdapter`): send operations in one request to a bulk
+  endpoint, or, with an adapter that has none, as that many requests side
+  by side. Each operation still gets its own outcome.
+- `LocalAdapter.applyRemoteBatch` and `RemoteChange` (also on
+  `CallbackLocalAdapter`): write a pulled page with one statement. The
+  default calls `applyRemote` for each record, as before.
+- `SyncEngine.cancelSync()`.
+- `SyncStatus.runPushed` and `runPulled`: the progress of a run.
+- `SyncConfig.serverUnavailableThreshold`, `PushRetry.serverUnavailable`,
+  `SyncPhase.serverUnavailable`.
+- `SyncConfig.outboxPageSize`.
+- `pendingOperations` and `failedOperations` take `limit` and `afterSeq`.
+- `SyncStore`: `operationsPage`, `operationsForRecords`, `markOperations`,
+  `deleteOperations`, `countOperations`, `nextAttemptAfter`, `clearBackoff`,
+  `localIdsWithOperations`, `localIdsForServer`, `mappingsForLocal`,
+  `putMappings`.
+- `SyncReference.rewriteInPlace`.
+
+### Other
+
+- README: a "Large data sets" section.
+- 322 package tests (from 202), including the store contract run against
+  a store that implements only the required members.
+
 ## 0.3.0
 
 Integration release: the engine now plugs into more of the storage, network

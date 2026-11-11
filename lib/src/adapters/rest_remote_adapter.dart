@@ -497,8 +497,14 @@ class RestRemoteAdapter extends RemoteAdapter {
       return const PushOutcome.success();
     }
     if (code == 408 || code == 425 || code == 429 || code >= 500) {
-      return PushOutcome.retry(failure,
-          retryAfter: parseRetryAfter(response.header('retry-after')));
+      return PushOutcome.retry(
+        failure,
+        retryAfter: parseRetryAfter(response.header('retry-after')),
+        // These say the server cannot take requests right now, whatever the
+        // operation; a 500 may be about this one record only.
+        serverUnavailable:
+            code == 429 || code == 502 || code == 503 || code == 504,
+      );
     }
     return PushOutcome.rejected(failure);
   }

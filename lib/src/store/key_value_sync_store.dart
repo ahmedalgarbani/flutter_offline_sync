@@ -58,10 +58,13 @@ class CallbackKeyValueStorage extends KeyValueStorage {
 /// A durable [SyncStore] for apps that keep their data in a key/value
 /// store (Hive, SharedPreferences, Isar, ObjectBox, ...) rather than SQLite.
 ///
-/// It works in memory like [InMemorySyncStore] and saves its whole state as
+/// It works in memory like [InMemorySyncStore] and saves its whole state
+/// (the outbox, and the id map with one entry per synchronized record) as
 /// one JSON string to [storage] under [key] after every committed change,
-/// before the change's future completes. It suits outboxes of up to a few
-/// thousand operations; with SQLite available, prefer `SqlSyncStore`.
+/// before the change's future completes. That suits small data sets: up to
+/// a few thousand queued operations and synchronized records. For more, or
+/// whenever SQLite is available, use `SqlSyncStore`, whose cost does not
+/// grow with the amount of data.
 ///
 /// Your own writes cannot share a transaction with this store, so record
 /// each change right after writing it locally:
